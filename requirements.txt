@@ -1,0 +1,6 @@
+# requirements.txt
+ollama          # para rodar Gemma 12B localmente
+sentence-transformers  # embeddings
+chromadb        # banco vetorial (gratuito, local)
+langchain       # chunking e utilidades RAG
+pypdf           # ler PDFs
