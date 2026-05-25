@@ -2,13 +2,6 @@
 agent/jarvis.py
 ---------------
 Agente principal do JARVIS Academico.
-
-Integra:
-  - Gemma 12B via API do professor (compativel com OpenAI)
-  - Tool calling via prompt estruturado
-  - 11 ferramentas: agenda, tarefas, RAG, aprendizado, notas
-  - Logs automaticos de cada chamada de ferramenta
-  - Historico de conversa (memoria da sessao)
 """
 
 import json
@@ -24,68 +17,66 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from tools.agenda import consultar_agenda
 from tools.tasks import (
-    listar_tarefas,
-    adicionar_tarefa,
-    concluir_tarefa,
-    atualizar_data_entrega,
-    tarefas_proximas,
-    remover_tarefa,
+    listar_tarefas, adicionar_tarefa, concluir_tarefa, concluir_tarefa_por_nome,
+    atualizar_data_entrega, tarefas_proximas, remover_tarefa, remover_tarefa_por_nome,
 )
 from tools.rag_tool import buscar_material_rag
 from tools.notas import (
-    cadastrar_disciplina,
-    registrar_nota,
-    consultar_notas,
-    calcular_media,
-    nota_necessaria,
-    listar_disciplinas,
-    remover_disciplina,
+    cadastrar_disciplina, registrar_nota, consultar_notas,
+    calcular_media, nota_necessaria, listar_disciplinas, remover_disciplina,
 )
 from tools.pdf_reader import (
-    processar_pdf_com_instrucao,
-    confirmar_importacao_agenda,
-    confirmar_importacao_notas,
+    processar_pdf_com_instrucao, confirmar_importacao_agenda, confirmar_importacao_notas,
 )
 
 # ---------------------------------------------------------------------------
-# Configuracao de logs
+# Logs
 # ---------------------------------------------------------------------------
 os.makedirs("logs", exist_ok=True)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("jarvis")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    try:
+        _handler = logging.FileHandler("logs/jarvis.log", encoding="utf-8", delay=True)
+    except OSError:
+        import tempfile
+        _handler = logging.FileHandler(
+            os.path.join(tempfile.gettempdir(), "jarvis.log"), 
+            encoding="utf-8", delay=True
+        )
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger.addHandler(_handler)
+logger.propagate = False
 
 # ---------------------------------------------------------------------------
-# Cliente da API do professor
+# Cliente API
 # ---------------------------------------------------------------------------
 client = OpenAI(
     base_url="https://llm.liaufms.org/v1/gemma-3-12b-it",
     api_key="Cxt2ftLF7d3mHS2JdiFqB-eSDAQeZvFATPXPs02lV9A",
 )
-
 MODEL = "google/gemma-3-12b-it"
 
 # ---------------------------------------------------------------------------
-# Mapa de ferramentas disponiveis
+# Mapa de ferramentas
 # ---------------------------------------------------------------------------
 from agent.learning import LearningModule
 _learning = LearningModule()
 
 TOOL_MAP = {
-    # Agenda
     "consultar_agenda":              consultar_agenda,
-    # Tarefas
     "listar_tarefas":                listar_tarefas,
     "adicionar_tarefa":              adicionar_tarefa,
     "concluir_tarefa":               concluir_tarefa,
+    "concluir_tarefa_por_nome":      concluir_tarefa_por_nome,
     "atualizar_data_entrega":        atualizar_data_entrega,
     "tarefas_proximas":              tarefas_proximas,
     "remover_tarefa":                remover_tarefa,
-    # RAG
+    "remover_tarefa_por_nome":       remover_tarefa_por_nome,
     "buscar_material_rag":           buscar_material_rag,
-    # Aprendizado
     "gerar_exercicios":              lambda topico, quantidade=3: _learning.gerar_exercicios(topico, int(quantidade)),
     "gerar_exercicios_com_gabarito": lambda topico, quantidade=3: _learning.gerar_exercicios_com_gabarito(topico, int(quantidade)),
     "active_recall":                 lambda topico: _learning.gerar_pergunta_active_recall(topico),
-    # Notas
     "cadastrar_disciplina":          cadastrar_disciplina,
     "registrar_nota":                registrar_nota,
     "consultar_notas":               consultar_notas,
@@ -93,12 +84,153 @@ TOOL_MAP = {
     "nota_necessaria":               nota_necessaria,
     "listar_disciplinas":            listar_disciplinas,
     "remover_disciplina":            remover_disciplina,
-    # PDF
-    "processar_pdf":               processar_pdf_com_instrucao,
-    "confirmar_importacao_agenda": confirmar_importacao_agenda,
-    "confirmar_importacao_notas":  confirmar_importacao_notas,
+    "processar_pdf":                 processar_pdf_com_instrucao,
+    "confirmar_importacao_agenda":   confirmar_importacao_agenda,
+    "confirmar_importacao_notas":    confirmar_importacao_notas,
 }
 
+FERRAMENTAS_RESPOSTA_LOCAL = {
+    "listar_tarefas", "tarefas_proximas", "consultar_agenda",
+    "adicionar_tarefa", "concluir_tarefa", "concluir_tarefa_por_nome",
+    "remover_tarefa", "remover_tarefa_por_nome", "atualizar_data_entrega",
+    "listar_disciplinas", "registrar_nota", "calcular_media",
+    "nota_necessaria", "remover_disciplina",
+    "cadastrar_disciplina", "consultar_notas",  # adicionar estas duas
+}
+
+# ---------------------------------------------------------------------------
+# Contexto do banco
+# ---------------------------------------------------------------------------
+def _contexto_tarefas() -> str:
+    try:
+        tasks = listar_tarefas()
+        if not tasks:
+            return "TAREFAS NO BANCO: nenhuma tarefa cadastrada."
+        hoje = date.today().isoformat()
+        linhas = ["TAREFAS NO BANCO (use estes indices e nomes EXATOS):"]
+        for i, t in enumerate(tasks):
+            status = "CONCLUIDA" if t.get("concluida") else "pendente"
+            prazo  = t.get("data_entrega", "sem data")
+            if prazo and prazo != "sem data":
+                p = prazo.split("-")
+                prazo_fmt = f"{p[2]}/{p[1]}/{p[0]}"
+                if not t.get("concluida") and prazo < hoje:
+                    prazo_fmt += " (ATRASADA)"
+            else:
+                prazo_fmt = "sem data"
+            linhas.append(
+                f"  indice={i} | '{t['descricao']}' | {status} | "
+                f"prioridade={t.get('prioridade','normal')} | entrega={prazo_fmt}"
+            )
+        return "\n".join(linhas)
+    except Exception:
+        return ""
+
+def _contexto_agenda() -> str:
+    try:
+        r = consultar_agenda()
+        if isinstance(r, dict):
+            eventos = r.get("eventos", [])
+            if not eventos:
+                return f"AGENDA HOJE: {r.get('mensagem', 'sem eventos')}"
+            linhas = ["AGENDA HOJE:"]
+            for e in eventos:
+                linhas.append(f"  {e.get('hora','')}: {e.get('evento','')}")
+            return "\n".join(linhas)
+    except Exception:
+        pass
+    return ""
+
+# ---------------------------------------------------------------------------
+# Respostas locais
+# ---------------------------------------------------------------------------
+def _resposta_local(tool_name: str, resultado_str: str) -> str:
+    try:
+        dados = json.loads(resultado_str)
+    except Exception:
+        return resultado_str
+
+    hoje = date.today().isoformat()
+
+    if tool_name in ("listar_tarefas", "tarefas_proximas"):
+        if not isinstance(dados, list) or len(dados) == 0:
+            return "Voce nao tem tarefas no momento."
+        pendentes  = [t for t in dados if not t.get("concluida")]
+        concluidas = [t for t in dados if t.get("concluida")]
+        linhas = []
+        if pendentes:
+            linhas.append("Tarefas pendentes:")
+            for i, t in enumerate(pendentes):
+                linha = f"  {i+1}. {t.get('descricao', '')}"
+                prazo   = t.get("data_entrega")
+                horario = t.get("horario", "23:59")
+                if prazo:
+                    p = prazo.split("-")
+                    fmt = f"{p[2]}/{p[1]}/{p[0]} {horario}"
+                    if prazo < hoje:   linha += f" - ATRASADA ({fmt})"
+                    elif prazo == hoje: linha += f" - VENCE HOJE ({fmt})"
+                    else:              linha += f" - entrega: {fmt}"
+                prio = t.get("prioridade")
+                if prio and prio != "normal":
+                    linha += f" [{prio}]"
+                linhas.append(linha)
+        if concluidas:
+            linhas.append(f"\nConcluidas: {len(concluidas)} tarefa(s).")
+        return "\n".join(linhas)
+
+    if tool_name == "consultar_agenda":
+        if isinstance(dados, dict):
+            eventos = dados.get("eventos", [])
+            if not eventos:
+                return dados.get("mensagem", "Nenhum evento encontrado.")
+            return "Agenda:\n" + "\n".join(f"  - {e.get('hora','')}: {e.get('evento','')}" for e in eventos)
+
+    if tool_name == "adicionar_tarefa":
+        if isinstance(dados, dict) and dados.get("status") == "ok":
+            t = dados.get("tarefa", {})
+            msg = f"Tarefa adicionada: {t.get('descricao', '')}"
+            prazo = t.get("data_entrega")
+            if prazo:
+                p = prazo.split("-")
+                msg += f" (entrega: {p[2]}/{p[1]}/{p[0]})"
+            prio = t.get("prioridade")
+            if prio and prio != "normal":
+                msg += f" [{prio}]"
+            return msg
+        return dados.get("mensagem", str(dados)) if isinstance(dados, dict) else str(dados)
+
+    if tool_name in ("concluir_tarefa", "concluir_tarefa_por_nome",
+                     "remover_tarefa", "remover_tarefa_por_nome", "atualizar_data_entrega"):
+        if isinstance(dados, dict):
+            return dados.get("mensagem", "Operacao realizada com sucesso.")
+
+    if tool_name == "listar_disciplinas":
+        if isinstance(dados, dict):
+            return dados.get("mensagem", str(dados))
+        if isinstance(dados, list):
+            if not dados:
+                return "Nenhuma disciplina cadastrada."
+            linhas = ["Suas disciplinas:"]
+            for d in dados:
+                linha = f"  - {d.get('nome','')}"
+                media = d.get("media_atual")
+                if media is not None:
+                    linha += f" | Media: {media:.1f}"
+                situacao = d.get("situacao", "")
+                if situacao:
+                    linha += f" | {situacao}"
+                linhas.append(linha)
+            return "\n".join(linhas)
+
+    if tool_name in ("registrar_nota", "calcular_media", "nota_necessaria", "remover_disciplina"):
+        if isinstance(dados, dict):
+            return dados.get("mensagem", "Operacao realizada com sucesso.")
+
+    if isinstance(dados, dict):
+        return dados.get("mensagem", str(dados))
+    if isinstance(dados, list):
+        return "\n".join(str(item) for item in dados)
+    return str(dados)
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -121,151 +253,54 @@ sem nenhum texto antes ou depois:
 ```
 
 ### AGENDA
-
-1. consultar_agenda - Consulta eventos da agenda academica por dia.
-   - args: {{"dia": "YYYY-MM-DD"}}
-   - Use quando: "o que tenho hoje?", "tenho aula amanha?", "agenda da semana"
+1. consultar_agenda - args: {{"dia": "YYYY-MM-DD"}}
 
 ### TAREFAS
+2. listar_tarefas   - args: {{"filtro": "pendentes|concluidas|atrasadas|hoje"}} ou {{}}
+3. adicionar_tarefa - args: {{"descricao": "texto", "data_entrega": "DD/MM/YYYY", "horario": "HH:MM", "prioridade": "alta|normal|baixa"}}
+   - horario e opcional; se nao informado usa 23:59
+   - Exemplos de horario: "14:00", "9h30", "08:00"
+4. concluir_tarefa_por_nome - PREFERIR. args: {{"nome": "nome EXATO da tarefa"}}
+5. concluir_tarefa  - args: {{"indice": 0}}
+6. atualizar_data_entrega - args: {{"indice": 0, "nova_data": "DD/MM/YYYY"}}
+7. tarefas_proximas - args: {{"dias": 7}}
+8. remover_tarefa_por_nome - PREFERIR. args: {{"nome": "nome EXATO da tarefa"}}
+9. remover_tarefa   - args: {{"indice": 0}}
 
-2. listar_tarefas - Lista tarefas com filtro opcional.
-   - args: {{"filtro": "pendentes|concluidas|atrasadas|hoje"}} ou {{}} para todas
-   - Use quando: "quais minhas tarefas?", "tenho tarefas atrasadas?"
-
-3. adicionar_tarefa - Adiciona uma nova tarefa.
-   - args: {{"descricao": "texto", "data_entrega": "DD/MM/YYYY", "prioridade": "alta|normal|baixa"}}
-   - data_entrega e prioridade sao opcionais
-   - Use quando: "adicionar tarefa X", "lembrar de fazer X ate dia Y"
-
-4. concluir_tarefa - Marca uma tarefa como concluida pelo indice (comeca em 0).
-   - args: {{"indice": 0}}
-   - Use quando: "concluir tarefa 1", "marcar como feito"
-
-5. atualizar_data_entrega - Atualiza a data de entrega de uma tarefa.
-   - args: {{"indice": 0, "nova_data": "DD/MM/YYYY"}}
-   - Use quando: "mudar prazo da tarefa X para Y"
-
-6. tarefas_proximas - Lista tarefas com entrega nos proximos N dias.
-   - args: {{"dias": 7}}
-   - Use quando: "o que vence essa semana?", "tarefas dos proximos 3 dias"
-
-7. remover_tarefa - Remove permanentemente uma tarefa pelo indice.
-   - args: {{"indice": 0}}
-   - Use quando: "deletar tarefa X", "remover tarefa"
-
-### MATERIAIS DE ESTUDO (RAG)
-
-8. buscar_material_rag - Busca informacoes nos materiais de estudo indexados.
-   - args: {{"query": "termo ou pergunta de busca"}}
-   - Use quando: "explique X", "o que e Y?", "como funciona Z?", "resuma sobre..."
+### RAG
+10. buscar_material_rag - args: {{"query": "termo ou pergunta"}}
 
 ### APRENDIZADO
+11. gerar_exercicios              - args: {{"topico": "nome", "quantidade": 3}}
+12. gerar_exercicios_com_gabarito - args: {{"topico": "nome", "quantidade": 3}}
+13. active_recall                 - args: {{"topico": "nome"}}
 
-9. gerar_exercicios - Gera exercicios SEM gabarito sobre um topico.
-   - args: {{"topico": "nome do topico", "quantidade": 3}}
-   - Use quando: "crie exercicios sobre X", "gere questoes sobre Y", "exercicios de Z"
-   - IMPORTANTE: gera apenas enunciados, sem respostas
+### NOTAS
+14. cadastrar_disciplina - args: {{"nome": "nome", "avaliacoes": ["P1","P2"], "formula": "media_simples|ponderada|maior_nota|soma_direta|personalizada", "pesos": {{}}, "nota_minima": 6.0}}
+15. registrar_nota       - args: {{"disciplina": "nome", "avaliacao": "P1", "nota": 7.5}}
+16. consultar_notas      - args: {{"disciplina": "nome"}} ou {{}}
+17. calcular_media       - args: {{"disciplina": "nome"}}
+18. nota_necessaria      - args: {{"disciplina": "nome", "avaliacao_faltante": "P2"}}
+19. listar_disciplinas   - args: {{}}
+20. remover_disciplina   - args: {{"nome": "nome"}}
 
-10. gerar_exercicios_com_gabarito - Gera exercicios COM gabarito/respostas.
-    - args: {{"topico": "nome do topico", "quantidade": 3}}
-    - Use quando: usuario disse "sim" apos ver exercicios, ou pediu "com gabarito"
+### PDF
+21. processar_pdf               - args: {{"caminho": "C:/path/file.pdf", "instrucao": "o que fazer"}}
+22. confirmar_importacao_agenda - args: {{"eventos": [lista]}}
+23. confirmar_importacao_notas  - args: {{"disciplinas": [lista]}}
 
-11. active_recall - Gera uma pergunta de revisao interativa sobre um topico.
-    - args: {{"topico": "nome do topico"}}
-    - Use quando: "me teste sobre X", "pergunta sobre Y", "active recall de Z"
-
-### NOTAS ACADEMICAS
-
-12. cadastrar_disciplina - Cadastra uma disciplina com formula de calculo flexivel.
-    - args: {{
-        "nome": "nome da disciplina",
-        "avaliacoes": ["P1", "P2", "Trabalho"],
-        "formula": "media_simples|ponderada|maior_nota|soma_direta|personalizada",
-        "pesos": {{"P1": 0.3, "P2": 0.3, "Trabalho": 0.4}},
-        "nota_minima": 6.0,
-        "descricao_formula": "descricao em texto da formula (opcional)"
-      }}
-    - formulas disponiveis:
-        media_simples  = todas as avaliacoes tem peso igual
-        ponderada      = cada avaliacao tem peso definido pelo aluno (use pesos)
-        maior_nota     = descarta a menor nota antes de calcular
-        soma_direta    = soma todas as notas (ex: pontos acumulados)
-        personalizada  = aluno descreve a formula em texto (descricao_formula)
-    - Use quando: "cadastrar disciplina X", "adicionar materia Y", "registrar formula de calculo"
-    - Exemplos de uso:
-        "Cadastra VVT com P1 e P2 valendo 30% cada e trabalho 40%"
-        "Adiciona Calculo com 3 provas em media simples, minimo 5"
-        "Registra IA com prova valendo 40% e trabalho 60%"
-
-13. registrar_nota - Registra ou atualiza a nota de uma avaliacao.
-    - args: {{"disciplina": "nome", "avaliacao": "P1", "nota": 7.5}}
-    - Use quando: "tirei X em Y", "registrar nota Z na disciplina W", "lancei nota"
-
-14. consultar_notas - Consulta notas de uma ou todas as disciplinas.
-    - args: {{"disciplina": "nome"}} ou {{}} para todas
-    - Use quando: "ver minhas notas", "como estou em X?", "notas de todas as materias"
-
-15. calcular_media - Calcula a media atual de uma disciplina.
-    - args: {{"disciplina": "nome"}}
-    - Use quando: "qual minha media em X?", "estou aprovado em Y?"
-
-16. nota_necessaria - Calcula a nota minima necessaria para aprovacao.
-    - args: {{"disciplina": "nome", "avaliacao_faltante": "P2"}}
-    - Use quando: "quanto preciso tirar em X?", "que nota preciso na prova final?"
-
-17. listar_disciplinas - Lista todas as disciplinas cadastradas com situacao.
-    - args: {{}}
-    - Use quando: "minhas materias", "situacao de todas as disciplinas", "estou aprovado em quais?"
-
-18. remover_disciplina - Remove uma disciplina e todas as suas notas.
-    - args: {{"nome": "nome da disciplina"}}
-    - Use quando: "remover disciplina X", "apagar materia Y"
-
-19. processar_pdf - Le um PDF e executa qualquer instrucao do usuario.
-    - args: {{"caminho": "C:/caminho/arquivo.pdf", "instrucao": "o que fazer"}}
-    - Use quando: usuario mencionar "PDF", "arquivo", "anexei", "tenho um documento"
-    - instrucao exemplos:
-        "adiciona as aulas na agenda"
-        "cadastra as disciplinas e notas"
-        "resume o conteudo"
-        "extraia os exercicios"
-        "quais sao os requisitos?"
-
-20. confirmar_importacao_agenda - Confirma adicao de eventos do PDF na agenda.
-    - args: {{"eventos": [lista]}}
-    - Use quando: usuario disse "sim" apos processar cronograma
-
-21. confirmar_importacao_notas - Confirma cadastro de disciplinas do PDF.
-    - args: {{"disciplinas": [lista]}}
-    - Use quando: usuario disse "sim" apos processar boletim de notas
-
-## REGRAS IMPORTANTES
-
-- Se a pergunta exigir uma ferramenta, responda APENAS com o JSON da ferramenta.
-- NUNCA escreva texto como "[tool]", "chamando ferramenta" antes do JSON.
-- NUNCA narre o que esta fazendo, apenas execute.
-- Apos receber o resultado, responda diretamente ao usuario em portugues.
-- Seja conciso, organizado e focado no aprendizado do estudante.
-- Nao use asteriscos (**) para negrito nas respostas.
-- Nao use markdown (##, **, __, etc) nas respostas, use texto simples.
-- Para notas, sempre mostre a situacao (aprovado/reprovado) e avaliacoes pendentes.
-- Para indices de tarefas, lembre que comecam em 0 (tarefa 1 = indice 0).
-- Hoje e {hoje_iso} e amanha e {amanha}.
-- Quando o usuario perguntar sobre nota necessaria, use a ferramenta nota_necessaria.
-- Quando cadastrar disciplina com pesos, confirme os pesos recebidos na resposta.
-- Ao consultar notas, mostre apenas: disciplina, notas lancadas, media atual e situacao (aprovado/reprovado).
-- NAO mostre detalhes do calculo (pesos, formula) a menos que o usuario pergunte explicitamente.
-- So mostre a formula e os pesos se o usuario perguntar "como e calculada?", "qual a formula?" ou similar.
+## REGRAS
+- Responda APENAS com o JSON quando usar ferramenta. Sem texto antes ou depois.
+- Nao use markdown nas respostas de texto.
+- Use aspas retas " nao aspas curvas.
+- SEMPRE use remover_tarefa_por_nome e concluir_tarefa_por_nome quando o usuario citar o nome.
+- Hoje e {hoje_iso}, amanha e {amanha}.
 """
 
-
 # ---------------------------------------------------------------------------
-# Classe principal do agente
+# Classe Jarvis
 # ---------------------------------------------------------------------------
 class Jarvis:
-    """
-    Agente JARVIS com memoria de conversa e tool calling via prompt.
-    """
 
     def __init__(self):
         self.historico: list[dict] = []
@@ -273,7 +308,6 @@ class Jarvis:
         print("JARVIS inicializado - Gemma 12B via API do professor")
 
     def _chamar_api(self, mensagens: list[dict]) -> str:
-        """Chama a API do Gemma 12B e retorna o texto da resposta."""
         try:
             response = client.chat.completions.create(
                 model=MODEL,
@@ -283,27 +317,34 @@ class Jarvis:
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"Erro na API: {e}")
             return f"[ERRO] Falha na comunicacao com o modelo: {e}"
 
-    def _limpar_formatacao(self, texto: str) -> str:
-        """Remove formatacao markdown da resposta."""
-        texto = texto.replace("**", "")
-        texto = texto.replace("__", "")
+    def _limpar(self, texto: str) -> str:
+        texto = texto.replace("**", "").replace("__", "")
         texto = re.sub(r"^#{1,6}\s+", "", texto, flags=re.MULTILINE)
+        # Remove blocos json visiveis
+        texto = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", texto, flags=re.DOTALL)
+        texto = re.sub(r"```\s*\{.*?\}\s*```", "", texto, flags=re.DOTALL)
         return texto.strip()
 
+    def _normalizar_aspas(self, texto: str) -> str:
+        """Converte aspas tipograficas para aspas retas."""
+        texto = texto.replace('\u201c', '"').replace('\u201d', '"')
+        texto = texto.replace('\u2018', "'").replace('\u2019', "'")
+        texto = texto.replace('\u00ab', '"').replace('\u00bb', '"')
+        return texto
+
     def _extrair_tool_call(self, texto: str) -> dict | None:
-        """
-        Tenta extrair um JSON de tool call da resposta do modelo.
-        Retorna dict com 'tool' e 'args' ou None se nao for um tool call.
-        """
+        # Normaliza aspas antes de tentar extrair
+        texto = self._normalizar_aspas(texto)
+
         padroes = [
             r"```json\s*(\{.*?\})\s*```",
             r"```\s*(\{.*?\})\s*```",
             r"(\{[^{}]*\"tool\"[^{}]*\})",
+            # Captura JSON sem bloco de codigo
+            r'(\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*\}\s*\})',
         ]
-
         for padrao in padroes:
             match = re.search(padrao, texto, re.DOTALL)
             if match:
@@ -311,168 +352,151 @@ class Jarvis:
                     dados = json.loads(match.group(1))
                     if "tool" in dados and dados["tool"] in TOOL_MAP:
                         return dados
+                    for chave in dados:
+                        if chave in TOOL_MAP and isinstance(dados[chave], dict):
+                            return {"tool": chave, "args": dados[chave]}
                 except json.JSONDecodeError:
                     continue
-
         return None
 
     def _executar_ferramenta(self, tool_call: dict) -> str:
-        """
-        Executa a ferramenta indicada e retorna o resultado como string.
-        Registra log com ferramenta, entrada e saida.
-        """
         nome = tool_call.get("tool")
         args = tool_call.get("args", {})
-
         if nome not in TOOL_MAP:
             return f"[ERRO] Ferramenta '{nome}' nao encontrada."
-
         try:
             resultado = TOOL_MAP[nome](**args)
             resultado_str = (
                 json.dumps(resultado, ensure_ascii=False, indent=2)
-                if not isinstance(resultado, str)
-                else resultado
+                if not isinstance(resultado, str) else resultado
             )
-
-            log_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "ferramenta": nome,
-                "entrada": args,
-                "saida": resultado_str[:500],
-            }
-            logger.info(json.dumps(log_entry, ensure_ascii=False))
-
+            try:
+                logger.info(json.dumps({
+                    "timestamp": datetime.now().isoformat(),
+                    "ferramenta": nome, "entrada": args,
+                    "saida": resultado_str[:500],
+                }, ensure_ascii=False))
+            except Exception:
+                pass
             return resultado_str
-
         except TypeError as e:
-            erro = f"[ERRO] Argumentos invalidos para '{nome}': {e}"
-            logger.error(erro)
-            return erro
+            return f"[ERRO] Argumentos invalidos para '{nome}': {e}"
         except Exception as e:
-            erro = f"[ERRO] Falha ao executar '{nome}': {e}"
-            logger.error(erro)
-            return erro
+            import traceback; traceback.print_exc()
+            return f"[ERRO] Falha ao executar '{nome}': {e}"
+
+    def _validar_historico(self, historico: list) -> list:
+        """Garante alternancia user/assistant."""
+        if not historico:
+            return historico
+        validado = [historico[0]]
+        for msg in historico[1:]:
+            if msg["role"] == validado[-1]["role"]:
+                validado[-1] = msg
+            else:
+                validado.append(msg)
+        return validado
 
     def chat(self, mensagem_usuario: str) -> str:
-        """
-        Processa uma mensagem do usuario e retorna a resposta do JARVIS.
-        """
-        self.historico.append({
-            "role": "user",
-            "content": mensagem_usuario,
-        })
+        self.historico.append({"role": "user", "content": mensagem_usuario})
+
+        contexto_banco = _contexto_tarefas() + "\n" + _contexto_agenda()
+        system_completo = self.system_prompt + "\n\n" + contexto_banco
+        historico_valido = self._validar_historico(self.historico)
 
         mensagens = [
-            {"role": "system", "content": self.system_prompt},
-            *self.historico,
+            {"role": "system", "content": system_completo},
+            *historico_valido,
         ]
 
         resposta_modelo = self._chamar_api(mensagens)
-        tool_call = self._extrair_tool_call(resposta_modelo)
+        # Normaliza aspas antes de extrair tool call
+        resposta_modelo_norm = self._normalizar_aspas(resposta_modelo)
+        tool_call = self._extrair_tool_call(resposta_modelo_norm)
 
         if tool_call:
+            tool_name = tool_call.get("tool", "")
             resultado_ferramenta = self._executar_ferramenta(tool_call)
 
-            # Para gerar_exercicios, retorna direto sem passar pela LLM
-            if tool_call.get("tool") == "gerar_exercicios":
+            if tool_name in FERRAMENTAS_RESPOSTA_LOCAL:
+                resposta_final = _resposta_local(tool_name, resultado_ferramenta)
+                self.historico.append({"role": "assistant", "content": resposta_final})
+                return resposta_final
+
+            if tool_name == "gerar_exercicios":
                 try:
-                    resultado_dict = json.loads(resultado_ferramenta)
-                    exercicios = resultado_dict.get("exercicios", resultado_ferramenta)
+                    d = json.loads(resultado_ferramenta)
+                    exercicios = d.get("exercicios", resultado_ferramenta)
                 except Exception:
                     exercicios = resultado_ferramenta
-                resposta_final = self._limpar_formatacao(str(exercicios))
+                resposta_final = self._limpar(str(exercicios))
                 if "Deseja ver as respostas" not in resposta_final:
                     resposta_final += "\n\nDeseja ver as respostas? Digite 'sim' para ver o gabarito."
                 self.historico.append({"role": "assistant", "content": resposta_final})
                 return resposta_final
 
             mensagens_finais = [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": system_completo},
                 {"role": "user", "content": mensagem_usuario},
-                {"role": "assistant", "content": f"Vou usar a ferramenta {tool_call['tool']}."},
+                {"role": "assistant", "content": "Executando ferramenta..."},
                 {
                     "role": "user",
                     "content": (
-                        f"[Resultado da ferramenta '{tool_call['tool']}']: {resultado_ferramenta}. "
-                        "Responda ao usuario em portugues de forma clara e organizada. "
-                        "Nao use markdown, asteriscos ou simbolos especiais de formatacao. "
-                        "Use texto simples com quebras de linha quando necessario."
-                        "Responda ao usuario em portugues de forma clara e organizada. "
-                        "Para notas: mostre apenas disciplina, notas e situacao. "
-                        "NAO mostre pesos, formula ou detalhes de calculo a menos que o usuario pergunte."
+                        f"[Resultado da ferramenta '{tool_name}']: {resultado_ferramenta}. "
+                        "Responda ao usuario em portugues. "
+                        "Nao use markdown, asteriscos ou blocos de codigo. "
+                        "Texto simples apenas."
                     ),
                 },
             ]
-
-            resposta_final = self._chamar_api(mensagens_finais)
-            resposta_final = self._limpar_formatacao(resposta_final)
+            resposta_final = self._limpar(self._chamar_api(mensagens_finais))
             self.historico.append({"role": "assistant", "content": resposta_final})
             return resposta_final
 
         else:
-            resposta_modelo = self._limpar_formatacao(resposta_modelo)
-            self.historico.append({
-                "role": "assistant",
-                "content": resposta_modelo,
-            })
+            # Se a resposta parece ser um tool call mas nao foi reconhecido,
+            # tenta extrair manualmente qualquer JSON com nome de ferramenta
+            resposta_modelo = self._limpar(resposta_modelo)
+            self.historico.append({"role": "assistant", "content": resposta_modelo})
             return resposta_modelo
 
     def limpar_historico(self):
-        """Reinicia o historico de conversa."""
         self.historico = []
         print("Historico limpo.")
 
     def mostrar_historico(self):
-        """Exibe o historico da conversa atual."""
-        print("\n--- Historico da Conversa ---")
+        print("\n--- Historico ---")
         for msg in self.historico:
             role = "Voce" if msg["role"] == "user" else "JARVIS"
             print(f"{role}: {msg['content'][:150]}...")
-        print("-----------------------------\n")
-
+        print("-----------------\n")
 
 # ---------------------------------------------------------------------------
-# Loop principal CLI
+# CLI
 # ---------------------------------------------------------------------------
 def main():
     jarvis = Jarvis()
-
-    print("\n" + "=" * 55)
-    print("  JARVIS ACADEMICO - Assistente Inteligente")
-    print("=" * 55)
+    print("\n" + "=" * 50)
+    print("  JARVIS ACADEMICO")
     print("  Comandos: /limpar, /hist, /sair")
-    print("=" * 55 + "\n")
-
+    print("=" * 50 + "\n")
     while True:
         try:
             entrada = input("Voce: ").strip()
-
-            if not entrada:
-                continue
-
+            if not entrada: continue
             if entrada.lower() == "/sair":
-                print("JARVIS: Ate logo! Bons estudos!")
-                break
+                print("JARVIS: Ate logo!"); break
             elif entrada.lower() == "/limpar":
-                jarvis.limpar_historico()
-                continue
+                jarvis.limpar_historico(); continue
             elif entrada.lower() == "/hist":
-                jarvis.mostrar_historico()
-                continue
-
+                jarvis.mostrar_historico(); continue
             print("JARVIS: ", end="", flush=True)
-            resposta = jarvis.chat(entrada)
-            print(resposta)
+            print(jarvis.chat(entrada))
             print()
-
         except KeyboardInterrupt:
-            print("\nJARVIS: Encerrando... Ate logo!")
-            break
+            print("\nJARVIS: Encerrando!"); break
         except Exception as e:
-            print(f"\n[ERRO INESPERADO] {e}")
-            logger.error(f"Erro no loop principal: {e}")
-
+            print(f"\n[ERRO] {e}")
 
 if __name__ == "__main__":
     main()

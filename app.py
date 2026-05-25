@@ -2,22 +2,15 @@
 app.py
 ------
 Interface web do JARVIS usando Flask.
-
-Funcionalidades:
-  - Chat principal com o JARVIS
-  - Upload de PDF para processamento
-  - Painel lateral com agenda e tarefas
-  - Active Recall e Exercicios
-
-Uso:
-    python app.py
-    Acessa em: http://localhost:5000
 """
 
 import os
 import sys
 import warnings
 import logging
+import sqlite3
+import tempfile
+import re
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -29,26 +22,35 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 os.makedirs("logs", exist_ok=True)
-os.makedirs(r"C:\Users\lebro\data_store", exist_ok=True)
 
-# Pasta para uploads temporarios
-UPLOAD_FOLDER = r"C:\Users\lebro\data_store\uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# Upload folder: tenta dentro do projeto, fallback para temp do sistema
+_proj_uploads = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_store", "uploads")
+try:
+    os.makedirs(_proj_uploads, exist_ok=True)
+    UPLOAD_FOLDER = _proj_uploads
+except OSError:
+    UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), "jarvis_uploads")
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 from agent.jarvis import Jarvis
 from tools.agenda import consultar_agenda
-from tools.tasks import listar_tarefas
+from tools.tasks import (
+    listar_tarefas, remover_tarefa, concluir_tarefa,
+    atualizar_data_entrega, tarefas_proximas, DB_PATH
+)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 jarvis = Jarvis()
 
 print("JARVIS Web iniciado!")
+print(f"  Banco de dados: {DB_PATH}")
+print(f"  Upload folder:  {UPLOAD_FOLDER}")
 
 # ---------------------------------------------------------------------------
-# HTML da interface
+# HTML
 # ---------------------------------------------------------------------------
 
 HTML = """
@@ -62,7 +64,6 @@ HTML = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #333; }
 
-/* Header */
 .header { background: linear-gradient(135deg, #1a73e8, #0d47a1); color: white;
           padding: 15px 24px; display: flex; align-items: center; gap: 12px;
           box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
@@ -70,25 +71,20 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
 .header p  { font-size: 12px; opacity: 0.85; }
 .logo { font-size: 28px; }
 
-/* Layout */
 .container { display: flex; gap: 16px; padding: 16px; max-width: 1200px;
              margin: 0 auto; height: calc(100vh - 70px); }
 
-/* Chat */
 .chat-area { flex: 3; display: flex; flex-direction: column; gap: 10px; }
 
-/* Tabs */
 .tabs { display: flex; gap: 4px; }
 .tab { padding: 8px 16px; border: none; border-radius: 20px; cursor: pointer;
        font-size: 13px; background: white; color: #666; transition: all .2s; }
 .tab.active { background: #1a73e8; color: white; }
 .tab:hover:not(.active) { background: #e8f0fe; color: #1a73e8; }
 
-/* Paineis de conteudo */
 .panel-content { display: none; flex: 1; flex-direction: column; gap: 10px; }
 .panel-content.active { display: flex; }
 
-/* Chat box */
 #chat { flex: 1; overflow-y: auto; background: white; border-radius: 12px;
         padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); min-height: 300px; }
 .msg { margin: 8px 0; display: flex; }
@@ -100,7 +96,6 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
 .msg.bot  .bubble { background: #f1f3f4; color: #333; border-bottom-left-radius: 4px; }
 .msg.bot.typing .bubble { color: #999; font-style: italic; }
 
-/* Input area */
 .input-row { display: flex; gap: 8px; align-items: flex-end; }
 #msg { flex: 1; padding: 12px 16px; border: 1px solid #ddd; border-radius: 24px;
        font-size: 14px; resize: none; height: 44px; max-height: 120px;
@@ -112,13 +107,11 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
             transition: background .2s; flex-shrink: 0; }
 .btn-send:hover { background: #1557b0; }
 
-/* Upload area */
 .upload-area { background: white; border-radius: 12px; padding: 16px;
                box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
 .upload-area h3 { font-size: 14px; color: #444; margin-bottom: 10px; }
 .drop-zone { border: 2px dashed #1a73e8; border-radius: 10px; padding: 20px;
-             text-align: center; cursor: pointer; transition: all .2s;
-             background: #f8f9ff; }
+             text-align: center; cursor: pointer; transition: all .2s; background: #f8f9ff; }
 .drop-zone:hover, .drop-zone.dragover { background: #e8f0fe; border-color: #0d47a1; }
 .drop-zone p { color: #666; font-size: 13px; margin-top: 6px; }
 .drop-zone .icon { font-size: 28px; }
@@ -131,28 +124,45 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
               border-radius: 8px; cursor: pointer; font-size: 13px; white-space: nowrap; }
 .btn-upload:disabled { background: #ccc; cursor: not-allowed; }
 #fileName { font-size: 12px; color: #666; margin-top: 6px; }
-#uploadResult { margin-top: 10px; padding: 10px; border-radius: 8px;
-                font-size: 13px; display: none; white-space: pre-wrap; line-height: 1.5; }
-#uploadResult.ok    { background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
-#uploadResult.erro  { background: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
+#uploadResult { margin-top: 10px; padding: 10px; border-radius: 8px; font-size: 13px;
+                display: none; white-space: pre-wrap; line-height: 1.5; }
+#uploadResult.ok   { background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
+#uploadResult.erro { background: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
 
-/* Sidebar */
 .sidebar { flex: 1; display: flex; flex-direction: column; gap: 12px;
-           min-width: 220px; max-width: 280px; overflow-y: auto; }
+           min-width: 220px; max-width: 290px; overflow-y: auto; }
 .side-card { background: white; border-radius: 12px; padding: 14px;
              box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
-.side-card h3 { font-size: 13px; font-weight: 600; color: #444;
-                margin-bottom: 8px; display: flex; justify-content: space-between; }
+.side-card h3 { font-size: 13px; font-weight: 600; color: #444; margin-bottom: 8px;
+                display: flex; justify-content: space-between; align-items: center; }
 .side-card h3 button { background: none; border: none; cursor: pointer;
-                        color: #1a73e8; font-size: 12px; padding: 0; }
-.side-content { font-size: 12px; color: #555; line-height: 1.6;
-                white-space: pre-wrap; max-height: 180px; overflow-y: auto; }
-.btn-clear { width: 100%; padding: 6px; background: #f5f5f5; border: 1px solid #ddd;
-             border-radius: 6px; cursor: pointer; font-size: 12px; color: #666;
-             margin-top: 8px; }
-.btn-clear:hover { background: #eee; }
+                        color: #1a73e8; font-size: 14px; padding: 0; }
+.side-content { font-size: 12px; color: #555; line-height: 1.6; max-height: 200px; overflow-y: auto; }
 
-/* Active Recall e Exercicios */
+.task-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 0;
+             border-bottom: 1px solid #f5f5f5; font-size: 12px; }
+.task-item:last-child { border-bottom: none; }
+.task-check { cursor: pointer; width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }
+.task-body { flex: 1; }
+.task-desc { color: #333; font-weight: 500; }
+.task-desc.done { text-decoration: line-through; color: #aaa; }
+.task-meta { font-size: 11px; color: #999; }
+.prazo-atrasada { color: #c62828; font-weight: bold; }
+.prazo-hoje     { color: #e65100; font-weight: bold; }
+.prazo-ok       { color: #2e7d32; }
+.prio-alta   { color: #c62828; }
+.prio-normal { color: #e65100; }
+.prio-baixa  { color: #2e7d32; }
+.btn-del-task { background: none; border: none; color: #ddd; cursor: pointer;
+                font-size: 13px; padding: 0; flex-shrink: 0; }
+.btn-del-task:hover { color: #c62828; }
+.task-actions-btns { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.btn-sm { padding: 4px 10px; border: none; border-radius: 12px; cursor: pointer;
+          font-size: 11px; font-weight: bold; }
+.btn-sm-warn   { background: #fff3e0; color: #e65100; }
+.btn-sm-danger { background: #ffebee; color: #c62828; }
+.btn-sm:hover  { opacity: .8; }
+
 .form-group { margin-bottom: 10px; }
 .form-group label { font-size: 12px; color: #666; display: block; margin-bottom: 4px; }
 .form-input { width: 100%; padding: 8px 10px; border: 1px solid #ddd;
@@ -161,12 +171,10 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
 .btn-action { background: #1a73e8; color: white; border: none; padding: 8px 14px;
               border-radius: 8px; cursor: pointer; font-size: 13px; width: 100%; }
 .btn-action:hover { background: #1557b0; }
-.result-box { margin-top: 10px; background: #f8f9ff; border-radius: 8px;
-              padding: 10px; font-size: 12px; color: #333; line-height: 1.6;
-              white-space: pre-wrap; max-height: 200px; overflow-y: auto;
-              display: none; }
+.result-box { margin-top: 10px; background: #f8f9ff; border-radius: 8px; padding: 10px;
+              font-size: 12px; color: #333; line-height: 1.6; white-space: pre-wrap;
+              max-height: 200px; overflow-y: auto; display: none; }
 
-/* Scrollbar */
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
@@ -183,34 +191,26 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
 </div>
 
 <div class="container">
-
-  <!-- Area principal -->
   <div class="chat-area">
-
-    <!-- Tabs -->
     <div class="tabs">
-      <button class="tab active" onclick="showTab('chat')">💬 Chat</button>
-      <button class="tab" onclick="showTab('pdf')">📄 Enviar PDF</button>
-      <button class="tab" onclick="showTab('recall')">🧠 Active Recall</button>
-      <button class="tab" onclick="showTab('exercicios')">📝 Exercicios</button>
+      <button class="tab active" onclick="showTab('chat', this)">💬 Chat</button>
+      <button class="tab" onclick="showTab('pdf', this)">📄 Enviar PDF</button>
+      <button class="tab" onclick="showTab('recall', this)">🧠 Active Recall</button>
+      <button class="tab" onclick="showTab('exercicios', this)">📝 Exercicios</button>
     </div>
 
-    <!-- Tab: Chat -->
     <div id="tab-chat" class="panel-content active">
       <div id="chat">
-        <div class="msg bot">
-          <div class="bubble">Ola! Sou o JARVIS, seu assistente academico. Como posso ajudar?</div>
-        </div>
+        <div class="msg bot"><div class="bubble">Ola! Sou o JARVIS, seu assistente academico. Como posso ajudar?</div></div>
       </div>
       <div class="input-row">
         <textarea id="msg" placeholder="Pergunte algo... (Enter para enviar)"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();enviar()}"></textarea>
-        <button class="btn-send" onclick="enviar()">➤</button>
+        <button class="btn-send" onclick="enviar()">&#10148;</button>
       </div>
-      <button class="btn-clear" onclick="limpar()">🗑️ Limpar conversa</button>
+      <button style="margin-top:4px;padding:6px;background:#f5f5f5;border:1px solid #ddd;border-radius:6px;cursor:pointer;font-size:12px;color:#666;width:100%" onclick="limpar()">🗑️ Limpar conversa</button>
     </div>
 
-    <!-- Tab: PDF -->
     <div id="tab-pdf" class="panel-content">
       <div class="upload-area">
         <h3>📄 Enviar PDF para o JARVIS</h3>
@@ -223,55 +223,36 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
         <input type="file" id="fileInput" accept=".pdf" onchange="fileSelected(this)">
         <div id="fileName"></div>
         <div class="upload-controls">
-          <input type="text" id="instrucao" class="form-input" style="font-size:13px"
-                 placeholder="O que fazer com o PDF? Ex: resume o conteudo, adiciona na agenda, cadastra notas...">
+          <input type="text" id="instrucao" class="form-input" placeholder="O que fazer com o PDF?">
           <button class="btn-upload" id="btnUpload" onclick="enviarPDF()" disabled>Enviar</button>
         </div>
         <div id="uploadResult"></div>
       </div>
-
-      <!-- Exemplos de instrucoes -->
       <div class="side-card">
         <h3>Exemplos de instrucoes</h3>
-        <div style="font-size:12px;color:#555;line-height:2">
-          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Adiciona as aulas na agenda')">
-            📅 Adiciona as aulas na agenda
-          </div>
-          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Cadastra as disciplinas e notas')">
-            📊 Cadastra as disciplinas e notas
-          </div>
-          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Resume o conteudo')">
-            📋 Resume o conteudo
-          </div>
-          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Extraia os exercicios')">
-            📝 Extraia os exercicios
-          </div>
-          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Quais sao os topicos principais?')">
-            🔍 Quais sao os topicos principais?
-          </div>
-          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Liste os requisitos do documento')">
-            📌 Liste os requisitos do documento
-          </div>
+        <div style="font-size:12px;color:#555;line-height:2.2">
+          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Adiciona as aulas na agenda')">📅 Adiciona as aulas na agenda</div>
+          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Cadastra as disciplinas e notas')">📊 Cadastra as disciplinas e notas</div>
+          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Resume o conteudo')">📋 Resume o conteudo</div>
+          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Extraia os exercicios')">📝 Extraia os exercicios</div>
+          <div style="cursor:pointer;color:#1a73e8" onclick="setInstrucao('Quais sao os topicos principais?')">🔍 Quais sao os topicos principais?</div>
         </div>
       </div>
     </div>
 
-    <!-- Tab: Active Recall -->
     <div id="tab-recall" class="panel-content">
       <div class="side-card" style="flex:none">
         <h3>🧠 Active Recall</h3>
         <div class="form-group">
           <label>Topico de estudo</label>
-          <input type="text" id="topicoRecall" class="form-input"
-                 placeholder="Ex: teste de caixa preta, KNN, embeddings...">
+          <input type="text" id="topicoRecall" class="form-input" placeholder="Ex: KNN, embeddings...">
         </div>
         <button class="btn-action" onclick="gerarPergunta()">Gerar pergunta</button>
         <div id="perguntaBox" class="result-box"></div>
         <div id="respostaArea" style="display:none;margin-top:10px">
           <div class="form-group">
             <label>Sua resposta</label>
-            <textarea id="respostaAluno" class="form-input" rows="3"
-                      placeholder="Digite sua resposta aqui..."></textarea>
+            <textarea id="respostaAluno" class="form-input" rows="3" placeholder="Digite sua resposta aqui..."></textarea>
           </div>
           <button class="btn-action" onclick="avaliarResposta()" style="background:#2e7d32">Avaliar resposta</button>
         </div>
@@ -279,14 +260,12 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
       </div>
     </div>
 
-    <!-- Tab: Exercicios -->
     <div id="tab-exercicios" class="panel-content">
       <div class="side-card" style="flex:none">
         <h3>📝 Gerar Exercicios</h3>
         <div class="form-group">
           <label>Topico</label>
-          <input type="text" id="topicoEx" class="form-input"
-                 placeholder="Ex: teste estrutural, piramide de testes...">
+          <input type="text" id="topicoEx" class="form-input" placeholder="Ex: teste estrutural...">
         </div>
         <div class="form-group">
           <label>Quantidade</label>
@@ -305,27 +284,22 @@ body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #
         <div id="gabaritoBox" class="result-box"></div>
       </div>
     </div>
-
   </div>
 
-  <!-- Sidebar -->
   <div class="sidebar">
-
     <div class="side-card">
       <h3>📅 Agenda de Hoje <button onclick="carregarAgenda()">↻</button></h3>
       <div id="agendaBox" class="side-content">Carregando...</div>
     </div>
-
     <div class="side-card">
-      <h3>✅ Tarefas Pendentes <button onclick="carregarTarefas()">↻</button></h3>
+      <h3>✅ Tarefas <button onclick="carregarTarefas()">↻</button></h3>
+      <div id="tarefasCount" style="font-size:11px;color:#999;margin-bottom:6px"></div>
       <div id="tarefasBox" class="side-content">Carregando...</div>
+      <div class="task-actions-btns">
+        <button class="btn-sm btn-sm-warn" onclick="apagarPendentes()">🗑 Apagar pendentes</button>
+        <button class="btn-sm btn-sm-danger" onclick="apagarTodas()">💥 Apagar todas</button>
+      </div>
     </div>
-
-    <div class="side-card">
-      <h3>📊 Minhas Notas <button onclick="carregarNotas()">↻</button></h3>
-      <div id="notasBox" class="side-content">Carregando...</div>
-    </div>
-
   </div>
 </div>
 
@@ -334,20 +308,18 @@ let arquivoSelecionado = null;
 let topicoAtualExercicios = '';
 let qtdAtualExercicios = 3;
 
-// ---------- Tabs ----------
-function showTab(name) {
+function showTab(name, btn) {
   document.querySelectorAll('.panel-content').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  event.target.classList.add('active');
+  btn.classList.add('active');
 }
 
-// ---------- Chat ----------
 function addMsg(texto, tipo) {
   const chat = document.getElementById('chat');
   const div  = document.createElement('div');
   div.className = 'msg ' + tipo;
-  div.innerHTML = `<div class="bubble">${texto.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
+  div.innerHTML = '<div class="bubble">' + esc(texto) + '</div>';
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
@@ -355,232 +327,193 @@ function addMsg(texto, tipo) {
 
 async function enviar() {
   const input = document.getElementById('msg');
-  const msg   = input.value.trim();
+  const msg = input.value.trim();
   if (!msg) return;
-  input.value = '';
-  input.style.height = '44px';
-
+  input.value = ''; input.style.height = '44px';
   addMsg(msg, 'user');
   const typing = addMsg('Pensando...', 'bot typing');
-
   try {
-    const r = await fetch('/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: msg})
-    });
+    const r = await fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message: msg})});
     const d = await r.json();
-    typing.remove();
-    addMsg(d.response, 'bot');
-  } catch(e) {
-    typing.remove();
-    addMsg('Erro de conexao: ' + e, 'bot');
-  }
+    typing.remove(); addMsg(d.response, 'bot');
+  } catch(e) { typing.remove(); addMsg('Erro: ' + e, 'bot'); }
   carregarPaineis();
 }
 
 async function limpar() {
-  await fetch('/limpar', {method: 'POST'});
-  document.getElementById('chat').innerHTML =
-    '<div class="msg bot"><div class="bubble">Historico limpo! Como posso ajudar?</div></div>';
+  await fetch('/limpar', {method:'POST'});
+  document.getElementById('chat').innerHTML = '<div class="msg bot"><div class="bubble">Historico limpo!</div></div>';
 }
 
-// ---------- Upload PDF ----------
 function dragOver(e)  { e.preventDefault(); document.getElementById('dropZone').classList.add('dragover'); }
 function dragLeave(e) { document.getElementById('dropZone').classList.remove('dragover'); }
-
 function dropFile(e) {
-  e.preventDefault();
-  dragLeave(e);
+  e.preventDefault(); dragLeave(e);
   const file = e.dataTransfer.files[0];
-  if (file && file.name.endsWith('.pdf')) {
-    arquivoSelecionado = file;
-    document.getElementById('fileName').textContent = 'Arquivo: ' + file.name;
-    document.getElementById('btnUpload').disabled = false;
-  } else {
-    alert('Por favor, selecione apenas arquivos PDF.');
-  }
+  if (file && file.name.endsWith('.pdf')) selecionarArquivo(file);
+  else alert('Apenas PDFs sao aceitos.');
 }
-
-function fileSelected(input) {
-  const file = input.files[0];
-  if (file) {
-    arquivoSelecionado = file;
-    document.getElementById('fileName').textContent = 'Arquivo: ' + file.name;
-    document.getElementById('btnUpload').disabled = false;
-  }
+function fileSelected(input) { if (input.files[0]) selecionarArquivo(input.files[0]); }
+function selecionarArquivo(file) {
+  arquivoSelecionado = file;
+  document.getElementById('fileName').textContent = 'Arquivo: ' + file.name;
+  document.getElementById('btnUpload').disabled = false;
 }
-
-function setInstrucao(texto) {
-  document.getElementById('instrucao').value = texto;
-}
-
+function setInstrucao(t) { document.getElementById('instrucao').value = t; }
 async function enviarPDF() {
   if (!arquivoSelecionado) return;
   const instrucao = document.getElementById('instrucao').value.trim() || 'resume o conteudo';
   const resultBox = document.getElementById('uploadResult');
-
-  resultBox.style.display = 'block';
-  resultBox.className = 'result-box ok';
+  resultBox.style.display = 'block'; resultBox.className = 'result-box ok';
   resultBox.textContent = 'Processando PDF... aguarde.';
-
   const formData = new FormData();
-  formData.append('file', arquivoSelecionado);
-  formData.append('instrucao', instrucao);
-
+  formData.append('file', arquivoSelecionado); formData.append('instrucao', instrucao);
   try {
-    const r = await fetch('/upload_pdf', {method: 'POST', body: formData});
+    const r = await fetch('/upload_pdf', {method:'POST', body: formData});
     const d = await r.json();
-
-    if (d.status === 'erro') {
-      resultBox.className = 'result-box erro';
-      resultBox.textContent = d.mensagem;
-    } else {
-      resultBox.className = 'result-box ok';
-      resultBox.textContent = d.mensagem;
-
-      // Se precisar de confirmacao, adiciona ao chat
-      if (d.precisa_confirmacao) {
-        showTab('chat');
-        document.querySelectorAll('.tab')[0].classList.add('active');
-        addMsg('[PDF: ' + arquivoSelecionado.name + ']\n' + instrucao, 'user');
-        addMsg(d.mensagem, 'bot');
-      }
-    }
-  } catch(e) {
-    resultBox.className = 'result-box erro';
-    resultBox.textContent = 'Erro ao enviar o arquivo: ' + e;
-  }
+    resultBox.className = d.status === 'erro' ? 'result-box erro' : 'result-box ok';
+    resultBox.textContent = d.mensagem;
+  } catch(e) { resultBox.className = 'result-box erro'; resultBox.textContent = 'Erro: ' + e; }
   carregarPaineis();
 }
 
-// ---------- Active Recall ----------
 async function gerarPergunta() {
   const topico = document.getElementById('topicoRecall').value.trim();
   if (!topico) { alert('Informe um topico.'); return; }
-
   const box = document.getElementById('perguntaBox');
-  box.style.display = 'block';
-  box.textContent = 'Gerando pergunta...';
+  box.style.display = 'block'; box.textContent = 'Gerando pergunta...';
   document.getElementById('respostaArea').style.display = 'none';
   document.getElementById('avaliacaoBox').style.display = 'none';
-
   try {
-    const r = await fetch('/active_recall', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({topico})
-    });
+    const r = await fetch('/active_recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({topico})});
     const d = await r.json();
     box.textContent = d.pergunta;
     document.getElementById('respostaArea').style.display = 'block';
     document.getElementById('respostaAluno').value = '';
-  } catch(e) {
-    box.textContent = 'Erro: ' + e;
-  }
+  } catch(e) { box.textContent = 'Erro: ' + e; }
 }
-
 async function avaliarResposta() {
   const pergunta = document.getElementById('perguntaBox').textContent;
   const resposta = document.getElementById('respostaAluno').value.trim();
   if (!resposta) { alert('Digite sua resposta.'); return; }
-
   const box = document.getElementById('avaliacaoBox');
-  box.style.display = 'block';
-  box.textContent = 'Avaliando...';
-
+  box.style.display = 'block'; box.textContent = 'Avaliando...';
   try {
-    const r = await fetch('/avaliar_recall', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pergunta, resposta})
-    });
+    const r = await fetch('/avaliar_recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({pergunta, resposta})});
     const d = await r.json();
-    box.textContent = d.avaliacao;
-  } catch(e) {
-    box.textContent = 'Erro: ' + e;
-  }
+    box.textContent = d.avaliacao.replace(/\*\*/g,'').replace(/#{1,6}\s/g,'');
+  } catch(e) { box.textContent = 'Erro: ' + e; }
 }
 
-// ---------- Exercicios ----------
 async function gerarExercicios() {
   const topico = document.getElementById('topicoEx').value.trim();
-  const qtd    = parseInt(document.getElementById('qtdEx').value);
+  const qtd = parseInt(document.getElementById('qtdEx').value);
   if (!topico) { alert('Informe um topico.'); return; }
-
-  topicoAtualExercicios = topico;
-  qtdAtualExercicios    = qtd;
-
+  topicoAtualExercicios = topico; qtdAtualExercicios = qtd;
   const box = document.getElementById('exerciciosBox');
-  box.style.display = 'block';
-  box.textContent   = 'Gerando exercicios...';
+  box.style.display = 'block'; box.textContent = 'Gerando exercicios...';
   document.getElementById('gabaritoArea').style.display = 'none';
-  document.getElementById('gabaritoBox').style.display  = 'none';
-
+  document.getElementById('gabaritoBox').style.display = 'none';
   try {
-    const r = await fetch('/gerar_exercicios', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({topico, quantidade: qtd})
-    });
+    const r = await fetch('/gerar_exercicios', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({topico, quantidade: qtd})});
     const d = await r.json();
     box.textContent = d.exercicios;
     document.getElementById('gabaritoArea').style.display = 'block';
-  } catch(e) {
-    box.textContent = 'Erro: ' + e;
-  }
+  } catch(e) { box.textContent = 'Erro: ' + e; }
 }
-
 async function verGabarito() {
   const box = document.getElementById('gabaritoBox');
-  box.style.display = 'block';
-  box.textContent   = 'Gerando gabarito...';
-
+  box.style.display = 'block'; box.textContent = 'Gerando gabarito...';
   try {
-    const r = await fetch('/gerar_exercicios_gabarito', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({topico: topicoAtualExercicios, quantidade: qtdAtualExercicios})
-    });
+    const r = await fetch('/gerar_exercicios_gabarito', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({topico: topicoAtualExercicios, quantidade: qtdAtualExercicios})});
     const d = await r.json();
     box.textContent = d.exercicios;
-  } catch(e) {
-    box.textContent = 'Erro: ' + e;
-  }
+  } catch(e) { box.textContent = 'Erro: ' + e; }
 }
 
-// ---------- Sidebar ----------
 async function carregarAgenda() {
-  const r = await fetch('/agenda');
-  const d = await r.json();
-  document.getElementById('agendaBox').textContent = d.mensagem;
+  try {
+    const r = await fetch('/agenda'); const d = await r.json();
+    const el = document.getElementById('agendaBox');
+    if (d.eventos && d.eventos.length > 0) {
+      el.innerHTML = d.eventos.map(e => '<div>🕐 <b>' + esc(e.hora) + '</b> — ' + esc(e.evento) + '</div>').join('');
+    } else { el.textContent = d.mensagem || 'Nenhum evento hoje.'; }
+  } catch(e) { document.getElementById('agendaBox').textContent = 'Erro ao carregar.'; }
 }
 
 async function carregarTarefas() {
-  const r = await fetch('/tarefas');
-  const d = await r.json();
-  document.getElementById('tarefasBox').textContent = d.mensagem;
+  try {
+    const r = await fetch('/api/tarefas'); const d = await r.json();
+    const tasks = d.tasks || [];
+    const hoje = new Date().toISOString().split('T')[0];
+    const pendentes = tasks.filter(t => !t.concluida).length;
+    const concluidas = tasks.filter(t => t.concluida).length;
+    document.getElementById('tarefasCount').textContent = pendentes + ' pendente(s) · ' + concluidas + ' concluida(s)';
+    const box = document.getElementById('tarefasBox');
+    if (tasks.length === 0) { box.innerHTML = '<span style="color:#aaa">Nenhuma tarefa.</span>'; return; }
+    box.innerHTML = tasks.map((t, i) => {
+      const prazo = prazoHtml(t.data_entrega, t.horario, hoje, t.concluida);
+      const pClass = t.prioridade === 'alta' ? 'prio-alta' : t.prioridade === 'baixa' ? 'prio-baixa' : 'prio-normal';
+      const dStyle = t.concluida ? 'done' : '';
+      return '<div class="task-item">' +
+        '<input class="task-check" type="checkbox" ' + (t.concluida ? 'checked' : '') + ' onchange="toggleTask(' + i + ', this.checked)">' +
+        '<div class="task-body"><div class="task-desc ' + dStyle + '">' + esc(t.descricao) + '</div>' +
+        '<div class="task-meta"><span class="' + pClass + '">' + (t.prioridade||'normal') + '</span>' + prazo + '</div></div>' +
+        '<button class="btn-del-task" onclick="deletarTask(' + i + ')">✕</button></div>';
+    }).join('');
+  } catch(e) { document.getElementById('tarefasBox').textContent = 'Erro ao carregar.'; }
+}
+
+function prazoHtml(data, horario, hoje, concluida) {
+  if (!data) return '';
+  const p = data.split('-');
+  const fmt = p[2]+'/'+p[1]+'/'+p[0];
+  const hora = horario || '23:59';
+  if (concluida)     return ' · <span class="prazo-ok">entrega: '+fmt+' '+hora+'</span>';
+  if (data < hoje)   return ' · <span class="prazo-atrasada">ATRASADA ('+fmt+' '+hora+')</span>';
+  if (data === hoje) return ' · <span class="prazo-hoje">HOJE '+hora+'</span>';
+  return ' · <span class="prazo-ok">📅 '+fmt+' '+hora+'</span>';
+}
+
+async function toggleTask(indice, concluida) {
+  if (concluida) await fetch('/api/tarefas/concluir', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({indice})});
+  carregarTarefas();
+}
+async function deletarTask(indice) {
+  if (!confirm('Remover esta tarefa?')) return;
+  await fetch('/api/tarefas/remover', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({indice})});
+  carregarTarefas();
+}
+async function apagarPendentes() {
+  if (!confirm('Apagar todas as tarefas pendentes?')) return;
+  await fetch('/api/tarefas/apagar-pendentes', {method:'POST'});
+  carregarTarefas();
+}
+async function apagarTodas() {
+  if (!confirm('Apagar TODAS as tarefas?')) return;
+  await fetch('/api/tarefas/apagar-todas', {method:'POST'});
+  carregarTarefas();
 }
 
 async function carregarNotas() {
-  const r = await fetch('/notas');
-  const d = await r.json();
-  document.getElementById('notasBox').textContent = d.mensagem;
+  try {
+    const r = await fetch('/notas'); const d = await r.json();
+    document.getElementById('notasBox').textContent = d.mensagem || 'Nenhuma nota cadastrada.';
+  } catch(e) { document.getElementById('notasBox').textContent = 'Erro ao carregar.'; }
 }
 
-function carregarPaineis() {
-  carregarAgenda();
-  carregarTarefas();
-  carregarNotas();
+function carregarPaineis() { carregarAgenda(); carregarTarefas(); carregarNotas(); }
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// Auto-resize textarea
 document.getElementById('msg').addEventListener('input', function() {
   this.style.height = '44px';
   this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 });
 
-// Inicializa
 carregarPaineis();
 </script>
 </body>
@@ -595,7 +528,6 @@ carregarPaineis();
 def index():
     return render_template_string(HTML)
 
-
 @app.route('/chat', methods=['POST'])
 def chat():
     msg = request.json.get('message', '')
@@ -605,87 +537,128 @@ def chat():
         resp = f"Erro: {e}"
     return jsonify({'response': resp})
 
-
 @app.route('/limpar', methods=['POST'])
 def limpar():
     jarvis.limpar_historico()
     return jsonify({'ok': True})
 
-
 @app.route('/upload_pdf', methods=['POST'])
 def upload_pdf():
     if 'file' not in request.files:
         return jsonify({'status': 'erro', 'mensagem': 'Nenhum arquivo enviado.'})
-
     file      = request.files['file']
     instrucao = request.form.get('instrucao', 'resume o conteudo')
-
     if not file.filename.endswith('.pdf'):
         return jsonify({'status': 'erro', 'mensagem': 'Apenas arquivos PDF sao aceitos.'})
-
-    # Salva o arquivo temporariamente
     nome_seguro = secure_filename(file.filename)
     caminho     = os.path.join(UPLOAD_FOLDER, nome_seguro)
     file.save(caminho)
-
     try:
         from tools.pdf_reader import processar_pdf_com_instrucao
         resultado = processar_pdf_com_instrucao(caminho, instrucao)
-
-        # Se precisar de confirmacao, registra no historico do jarvis
         precisa_confirmacao = bool(resultado.get('acoes'))
         if precisa_confirmacao:
-            jarvis.historico.append({
-                "role": "assistant",
-                "content": resultado['mensagem']
-            })
-            # Armazena dados para confirmacao posterior
+            jarvis.historico.append({"role": "assistant", "content": resultado['mensagem']})
             jarvis._pdf_pendente = resultado
-
         return jsonify({
-            'status':               resultado.get('status', 'ok'),
-            'mensagem':             resultado.get('mensagem', ''),
-            'precisa_confirmacao':  precisa_confirmacao,
-            'tipo':                 resultado.get('tipo', 'geral'),
+            'status':              resultado.get('status', 'ok'),
+            'mensagem':            resultado.get('mensagem', ''),
+            'precisa_confirmacao': precisa_confirmacao,
+            'tipo':                resultado.get('tipo', 'geral'),
         })
-
     except Exception as e:
         return jsonify({'status': 'erro', 'mensagem': f'Erro ao processar PDF: {e}'})
     finally:
-        # Remove arquivo temporario
-        try:
-            os.remove(caminho)
-        except Exception:
-            pass
-
+        try: os.remove(caminho)
+        except: pass
 
 @app.route('/agenda')
 def agenda():
     try:
         r = consultar_agenda()
-        return jsonify({'mensagem': r.get('mensagem', 'Sem eventos.')})
+        if not isinstance(r, dict):
+            r = {'mensagem': str(r), 'eventos': []}
+        if 'eventos' not in r:
+            r['eventos'] = []
+        # Adiciona tarefas de hoje como eventos na agenda
+        try:
+            tarefas_hoje = listar_tarefas(filtro="hoje")
+            for t in tarefas_hoje:
+                horario = t.get("horario", "23:59")
+                r['eventos'].append({
+                    'hora': horario,
+                    'evento': f"[TAREFA] {t['descricao']}",
+                    'tipo': 'tarefa'
+                })
+            # Ordena por hora
+            r['eventos'].sort(key=lambda e: e.get('hora', '00:00'))
+        except Exception:
+            pass
+        if not r.get('eventos'):
+            r['mensagem'] = r.get('mensagem', 'Nenhum evento hoje.')
+        return jsonify(r)
     except Exception as e:
-        return jsonify({'mensagem': f'Erro: {e}'})
+        return jsonify({'mensagem': f'Erro: {e}', 'eventos': []})
 
+@app.route('/api/tarefas')
+def api_tarefas():
+    try:
+        return jsonify({'tasks': listar_tarefas()})
+    except Exception as e:
+        return jsonify({'tasks': [], 'erro': str(e)})
+
+@app.route('/api/tarefas/concluir', methods=['POST'])
+def api_concluir():
+    indice = request.json.get('indice', -1)
+    try: return jsonify(concluir_tarefa(indice))
+    except Exception as e: return jsonify({'erro': str(e)})
+
+@app.route('/api/tarefas/remover', methods=['POST'])
+def api_remover():
+    indice = request.json.get('indice', -1)
+    try: return jsonify(remover_tarefa(indice))
+    except Exception as e: return jsonify({'erro': str(e)})
+
+@app.route('/api/tarefas/apagar-pendentes', methods=['POST'])
+def api_apagar_pendentes():
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("DELETE FROM tarefas WHERE concluida=0")
+            conn.commit()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'erro': str(e)})
+
+@app.route('/api/tarefas/apagar-todas', methods=['POST'])
+def api_apagar_todas():
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("DELETE FROM tarefas")
+            conn.commit()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'erro': str(e)})
 
 @app.route('/tarefas')
-def tarefas():
+def tarefas_legado():
     try:
-        r = listar_tarefas()
-        return jsonify({'mensagem': r.get('mensagem', 'Sem tarefas.')})
+        tasks = listar_tarefas()
+        pendentes = [t for t in tasks if not t.get('concluida')]
+        if not pendentes: return jsonify({'mensagem': 'Nenhuma tarefa pendente.'})
+        linhas = [f"{i+1}. {t['descricao']}" for i, t in enumerate(pendentes)]
+        return jsonify({'mensagem': '\n'.join(linhas)})
     except Exception as e:
         return jsonify({'mensagem': f'Erro: {e}'})
-
 
 @app.route('/notas')
 def notas():
     try:
         from tools.notas import listar_disciplinas
         r = listar_disciplinas()
-        return jsonify({'mensagem': r.get('mensagem', 'Nenhuma disciplina cadastrada.')})
+        if isinstance(r, dict): return jsonify({'mensagem': r.get('mensagem', 'Nenhuma nota cadastrada.')})
+        return jsonify({'mensagem': str(r)})
     except Exception as e:
         return jsonify({'mensagem': f'Erro: {e}'})
-
 
 @app.route('/active_recall', methods=['POST'])
 def active_recall():
@@ -698,7 +671,6 @@ def active_recall():
     except Exception as e:
         return jsonify({'pergunta': f'Erro: {e}'})
 
-
 @app.route('/avaliar_recall', methods=['POST'])
 def avaliar_recall():
     pergunta = request.json.get('pergunta', '')
@@ -707,10 +679,12 @@ def avaliar_recall():
         from agent.learning import LearningModule
         lm = LearningModule()
         r  = lm.avaliar_resposta(pergunta, resposta)
-        return jsonify({'avaliacao': r.get('avaliacao', 'Erro na avaliacao.')})
+        avaliacao = r.get('avaliacao', 'Erro na avaliacao.')
+        avaliacao = avaliacao.replace("**","").replace("__","")
+        avaliacao = re.sub(r"^#{1,6}\s+","", avaliacao, flags=re.MULTILINE)
+        return jsonify({'avaliacao': avaliacao.strip()})
     except Exception as e:
         return jsonify({'avaliacao': f'Erro: {e}'})
-
 
 @app.route('/gerar_exercicios', methods=['POST'])
 def gerar_exercicios():
@@ -720,15 +694,12 @@ def gerar_exercicios():
         from agent.learning import LearningModule
         lm = LearningModule()
         r  = lm.gerar_exercicios(topico, quantidade)
-        exercicios = r.get('exercicios', '')
-        # Remove a linha do gabarito (sera mostrada pelo botao)
-        exercicios = exercicios.replace(
+        exercicios = r.get('exercicios','').replace(
             "\n\nDeseja ver as respostas? Digite 'sim' para ver o gabarito.", ""
         ).strip()
         return jsonify({'exercicios': exercicios})
     except Exception as e:
         return jsonify({'exercicios': f'Erro: {e}'})
-
 
 @app.route('/gerar_exercicios_gabarito', methods=['POST'])
 def gerar_exercicios_gabarito():
@@ -738,15 +709,11 @@ def gerar_exercicios_gabarito():
         from agent.learning import LearningModule
         lm = LearningModule()
         r  = lm.gerar_exercicios_com_gabarito(topico, quantidade)
-        return jsonify({'exercicios': r.get('exercicios', '')})
+        return jsonify({'exercicios': r.get('exercicios','')})
     except Exception as e:
         return jsonify({'exercicios': f'Erro: {e}'})
 
-
 # ---------------------------------------------------------------------------
-# Inicializacao
-# ---------------------------------------------------------------------------
-
 if __name__ == '__main__':
     print("\nIniciando JARVIS Web...")
     print("Acesse em: http://localhost:5000\n")
