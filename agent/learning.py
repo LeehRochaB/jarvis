@@ -51,7 +51,7 @@ client = OpenAI(
 MODEL = "google/gemma-3-12b-it"
 
 
-def _chamar_llm(prompt: str, max_tokens: int = 800) -> str:
+def _chamar_llm(prompt: str, max_tokens: int = 4096) -> str:
     """Chama o Gemma 12B com um prompt simples e retorna o texto."""
     try:
         response = client.chat.completions.create(
@@ -210,7 +210,7 @@ Avalie a resposta do aluno de forma construtiva:
 
 Seja encorajador e didático. Responda em português."""
 
-        avaliacao = _chamar_llm(prompt, max_tokens=600)
+        avaliacao = _chamar_llm(prompt, max_tokens=4096)
 
         # Determina pontuação
         avaliacao_lower = avaliacao.lower()
@@ -303,7 +303,7 @@ Seja encorajador e didático. Responda em português."""
 
             Responda em portugues."""
 
-            resultado = _chamar_llm(prompt, max_tokens=2048)
+            resultado = _chamar_llm(prompt, max_tokens=4096)
             todos_exercicios.append(resultado)
 
         exercicios_final = "\n\n".join(todos_exercicios)

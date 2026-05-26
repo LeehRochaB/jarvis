@@ -2,23 +2,19 @@
 tools/tasks.py
 --------------
 Gerenciamento de tarefas usando SQLite.
+Banco em: <projeto>/data_store/jarvis.db
 """
 
 import sqlite3
-import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-_proj_db = Path(__file__).resolve().parent.parent / "data_store" / "jarvis.db"
-
-if "OneDrive" in str(_proj_db):
-    DB_PATH = Path(tempfile.gettempdir()) / "jarvis.db"
-    print(f"[JARVIS] OneDrive detectado — banco em: {DB_PATH}")
-else:
-    DB_PATH = _proj_db
-    print(f"[JARVIS] Banco em: {DB_PATH}")
-
+DB_PATH = Path(__file__).resolve().parent.parent / "data_store" / "jarvis.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Conexao e inicializacao
+# ---------------------------------------------------------------------------
 
 def _conectar():
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
@@ -28,31 +24,31 @@ def _conectar():
     return conn
 
 def _inicializar():
-    try:
-        with _conectar() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS tarefas (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    descricao    TEXT    NOT NULL,
-                    concluida    INTEGER NOT NULL DEFAULT 0,
-                    prioridade   TEXT    NOT NULL DEFAULT 'normal',
-                    data_entrega TEXT,
-                    horario      TEXT    DEFAULT '23:59',
-                    criada_em    TEXT    NOT NULL,
-                    concluida_em TEXT
-                )
-            """)
+    with _conectar() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tarefas (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                descricao    TEXT    NOT NULL,
+                concluida    INTEGER NOT NULL DEFAULT 0,
+                prioridade   TEXT    NOT NULL DEFAULT 'normal',
+                data_entrega TEXT,
+                horario      TEXT    DEFAULT '23:59',
+                criada_em    TEXT    NOT NULL,
+                concluida_em TEXT
+            )
+        """)
+        conn.commit()
+        try:
+            conn.execute("ALTER TABLE tarefas ADD COLUMN horario TEXT DEFAULT '23:59'")
             conn.commit()
-            # Adiciona coluna horario se nao existir (migracao)
-            try:
-                conn.execute("ALTER TABLE tarefas ADD COLUMN horario TEXT DEFAULT '23:59'")
-                conn.commit()
-            except Exception:
-                pass  # Coluna ja existe
-    except Exception as e:
-        print(f"[JARVIS] Erro ao inicializar banco: {e}")
+        except Exception:
+            pass
 
 _inicializar()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _normalizar_data(dia):
     if not dia:
@@ -60,7 +56,7 @@ def _normalizar_data(dia):
     dia = str(dia).strip().lower()
     if dia in ("hoje", "today"):
         return date.today().isoformat()
-    if dia in ("amanha", "amanha", "tomorrow"):
+    if dia in ("amanha", "tomorrow"):
         return (date.today() + timedelta(days=1)).isoformat()
     try:
         return datetime.strptime(dia, "%d/%m/%Y").date().isoformat()
@@ -74,7 +70,6 @@ def _normalizar_horario(horario):
     if not horario:
         return "23:59"
     horario = str(horario).strip()
-    # Aceita HH:MM ou HHhMM ou HH:MM:SS
     try:
         if "h" in horario.lower():
             horario = horario.lower().replace("h", ":")
@@ -99,6 +94,10 @@ def _row_to_dict(row):
         "concluida_em": row["concluida_em"],
     }
 
+# ---------------------------------------------------------------------------
+# CRUD
+# ---------------------------------------------------------------------------
+
 def listar_tarefas(filtro=None):
     hoje = date.today().isoformat()
     with _conectar() as conn:
@@ -121,8 +120,8 @@ def listar_tarefas(filtro=None):
     return [_row_to_dict(r) for r in rows]
 
 def adicionar_tarefa(descricao, data_entrega=None, horario=None, prioridade="normal"):
-    data_iso  = _normalizar_data(data_entrega)
-    hora_fmt  = _normalizar_horario(horario)
+    data_iso = _normalizar_data(data_entrega)
+    hora_fmt = _normalizar_horario(horario)
     prio = prioridade if prioridade in ("baixa", "normal", "alta") else "normal"
     with _conectar() as conn:
         cur = conn.execute(

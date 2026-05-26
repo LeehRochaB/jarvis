@@ -32,18 +32,14 @@ from tools.pdf_reader import (
 # ---------------------------------------------------------------------------
 # Logs
 # ---------------------------------------------------------------------------
-os.makedirs("logs", exist_ok=True)
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, "jarvis.log")
+
 logger = logging.getLogger("jarvis")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    try:
-        _handler = logging.FileHandler("logs/jarvis.log", encoding="utf-8", delay=True)
-    except OSError:
-        import tempfile
-        _handler = logging.FileHandler(
-            os.path.join(tempfile.gettempdir(), "jarvis.log"), 
-            encoding="utf-8", delay=True
-        )
+    _handler = logging.FileHandler(_LOG_FILE, encoding="utf-8", delay=True)
     _handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     logger.addHandler(_handler)
 logger.propagate = False
@@ -95,7 +91,6 @@ FERRAMENTAS_RESPOSTA_LOCAL = {
     "remover_tarefa", "remover_tarefa_por_nome", "atualizar_data_entrega",
     "listar_disciplinas", "registrar_nota", "calcular_media",
     "nota_necessaria", "remover_disciplina",
-    "cadastrar_disciplina", "consultar_notas",  # adicionar estas duas
 }
 
 # ---------------------------------------------------------------------------
