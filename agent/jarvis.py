@@ -48,10 +48,10 @@ logger.propagate = False
 # Cliente API
 # ---------------------------------------------------------------------------
 client = OpenAI(
-    base_url="https://llm.liaufms.org/v1/gemma-3-12b-it",
-    api_key="Cxt2ftLF7d3mHS2JdiFqB-eSDAQeZvFATPXPs02lV9A",
+    base_url="https://llm.liaufms.org/v1/qwen2-5-14b-instruct-awq",
+    api_key="REIkURcI7rTTqsTwlJi8MrgnKFwOiqky7Ezh7hH-l-k",
 )
-MODEL = "google/gemma-3-12b-it"
+MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
 
 # ---------------------------------------------------------------------------
 # Mapa de ferramentas
@@ -93,6 +93,25 @@ FERRAMENTAS_RESPOSTA_LOCAL = {
     "nota_necessaria", "remover_disciplina",
 }
 
+# Ferramentas bloqueadas durante planejamento
+FERRAMENTAS_BLOQUEADAS_PLANEJAMENTO = {
+    "adicionar_tarefa", "remover_tarefa", "remover_tarefa_por_nome",
+    "concluir_tarefa", "concluir_tarefa_por_nome", "atualizar_data_entrega",
+}
+
+# Palavras que indicam pedido de planejamento
+PALAVRAS_PLANEJAMENTO = [
+    "plano", "planejar", "planejamento", "priorizar", "prioridade",
+    "o que estudar", "o que revisar", "o que devo", "monte um",
+    "organize", "distribua", "como estudar", "roteiro de estudo",
+]
+
+
+def _e_pedido_planejamento(mensagem: str) -> bool:
+    msg = mensagem.lower()
+    return any(p in msg for p in PALAVRAS_PLANEJAMENTO)
+
+
 # ---------------------------------------------------------------------------
 # Contexto do banco
 # ---------------------------------------------------------------------------
@@ -121,6 +140,7 @@ def _contexto_tarefas() -> str:
     except Exception:
         return ""
 
+
 def _contexto_agenda() -> str:
     try:
         r = consultar_agenda()
@@ -135,6 +155,7 @@ def _contexto_agenda() -> str:
     except Exception:
         pass
     return ""
+
 
 # ---------------------------------------------------------------------------
 # Respostas locais
@@ -162,9 +183,9 @@ def _resposta_local(tool_name: str, resultado_str: str) -> str:
                 if prazo:
                     p = prazo.split("-")
                     fmt = f"{p[2]}/{p[1]}/{p[0]} {horario}"
-                    if prazo < hoje:   linha += f" - ATRASADA ({fmt})"
+                    if prazo < hoje:    linha += f" - ATRASADA ({fmt})"
                     elif prazo == hoje: linha += f" - VENCE HOJE ({fmt})"
-                    else:              linha += f" - entrega: {fmt}"
+                    else:               linha += f" - entrega: {fmt}"
                 prio = t.get("prioridade")
                 if prio and prio != "normal":
                     linha += f" [{prio}]"
@@ -178,7 +199,9 @@ def _resposta_local(tool_name: str, resultado_str: str) -> str:
             eventos = dados.get("eventos", [])
             if not eventos:
                 return dados.get("mensagem", "Nenhum evento encontrado.")
-            return "Agenda:\n" + "\n".join(f"  - {e.get('hora','')}: {e.get('evento','')}" for e in eventos)
+            return "Agenda:\n" + "\n".join(
+                f"  - {e.get('hora','')}: {e.get('evento','')}" for e in eventos
+            )
 
     if tool_name == "adicionar_tarefa":
         if isinstance(dados, dict) and dados.get("status") == "ok":
@@ -227,6 +250,7 @@ def _resposta_local(tool_name: str, resultado_str: str) -> str:
         return "\n".join(str(item) for item in dados)
     return str(dados)
 
+
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
@@ -254,7 +278,6 @@ sem nenhum texto antes ou depois:
 2. listar_tarefas   - args: {{"filtro": "pendentes|concluidas|atrasadas|hoje"}} ou {{}}
 3. adicionar_tarefa - args: {{"descricao": "texto", "data_entrega": "DD/MM/YYYY", "horario": "HH:MM", "prioridade": "alta|normal|baixa"}}
    - horario e opcional; se nao informado usa 23:59
-   - Exemplos de horario: "14:00", "9h30", "08:00"
 4. concluir_tarefa_por_nome - PREFERIR. args: {{"nome": "nome EXATO da tarefa"}}
 5. concluir_tarefa  - args: {{"indice": 0}}
 6. atualizar_data_entrega - args: {{"indice": 0, "nova_data": "DD/MM/YYYY"}}
@@ -290,7 +313,120 @@ sem nenhum texto antes ou depois:
 - Use aspas retas " nao aspas curvas.
 - SEMPRE use remover_tarefa_por_nome e concluir_tarefa_por_nome quando o usuario citar o nome.
 - Hoje e {hoje_iso}, amanha e {amanha}.
+- Para pedidos de planejamento, priorizacao ou 'o que estudar', use APENAS: listar_tarefas, consultar_agenda e buscar_material_rag. NUNCA chame adicionar_tarefa durante planejamento.
 """
+
+
+# ---------------------------------------------------------------------------
+# Planejamento direto (sem depender do modelo chamar ferramentas)
+# ---------------------------------------------------------------------------
+def _executar_planejamento(mensagem_usuario: str, system_completo: str) -> str:
+    """
+    Para pedidos de planejamento: coleta dados das 3 fontes diretamente
+    em Python e pede ao modelo apenas a sintese final em texto.
+    Isso evita que o modelo tente criar tarefas ao inves de gerar o plano.
+    """
+    # 1. Coleta tarefas
+    try:
+        tasks = listar_tarefas()
+        hoje = date.today().isoformat()
+        pendentes = [t for t in tasks if not t.get("concluida")] if tasks else []
+        linhas_tarefas = []
+        for t in pendentes:
+            prazo = t.get("data_entrega", "")
+            horario = t.get("horario", "23:59")
+            descricao = t.get("descricao", "")
+            prio = t.get("prioridade", "normal")
+            sufixo = ""
+            if prazo:
+                p = prazo.split("-")
+                fmt = f"{p[2]}/{p[1]}/{p[0]}"
+                if prazo < hoje:
+                    sufixo = f" [ATRASADA - {fmt}]"
+                elif prazo == hoje:
+                    sufixo = f" [VENCE HOJE - {fmt}]"
+                else:
+                    sufixo = f" [entrega: {fmt}]"
+            linhas_tarefas.append(f"- {descricao}{sufixo} (prioridade: {prio})")
+        dados_tarefas = "\n".join(linhas_tarefas) if linhas_tarefas else "Nenhuma tarefa pendente."
+        logger.info(json.dumps({"timestamp": datetime.now().isoformat(),
+                                "ferramenta": "listar_tarefas", "entrada": {},
+                                "saida": dados_tarefas[:200]}, ensure_ascii=False))
+    except Exception as e:
+        dados_tarefas = f"Erro ao carregar tarefas: {e}"
+
+    # 2. Coleta agenda
+    try:
+        agenda = consultar_agenda()
+        if isinstance(agenda, dict):
+            eventos = agenda.get("eventos", [])
+            if eventos:
+                dados_agenda = "\n".join(f"- {e.get('hora','')}: {e.get('evento','')}" for e in eventos)
+            else:
+                dados_agenda = agenda.get("mensagem", "Sem eventos hoje.")
+        else:
+            dados_agenda = str(agenda)
+        logger.info(json.dumps({"timestamp": datetime.now().isoformat(),
+                                "ferramenta": "consultar_agenda", "entrada": {},
+                                "saida": dados_agenda[:200]}, ensure_ascii=False))
+    except Exception as e:
+        dados_agenda = f"Erro ao carregar agenda: {e}"
+
+    # 3. Coleta materiais RAG com base nas tarefas pendentes
+    topicos_rag = []
+    for t in pendentes[:3]:
+        desc = t.get("descricao", "").lower()
+        if any(p in desc for p in ["vvt", "teste", "software", "verificacao", "validacao"]):
+            topicos_rag.append("criterios de teste verificacao validacao software VVT")
+            break
+    if not topicos_rag:
+        topicos_rag.append("tecnicas de teste de software")
+
+    dados_rag = ""
+    try:
+        resultado_rag = buscar_material_rag(topicos_rag[0], top_k=3)
+        dados_rag = resultado_rag.get("contexto", "Nenhum material encontrado.")
+        logger.info(json.dumps({"timestamp": datetime.now().isoformat(),
+                                "ferramenta": "buscar_material_rag",
+                                "entrada": {"query": topicos_rag[0]},
+                                "saida": dados_rag[:200]}, ensure_ascii=False))
+    except Exception as e:
+        dados_rag = f"Erro ao buscar materiais: {e}"
+
+    # 4. Pede ao modelo apenas a sintese em texto
+    mensagens_sintese = [
+        {"role": "system", "content": system_completo},
+        {
+            "role": "user",
+            "content": (
+                f"Solicitacao do estudante: {mensagem_usuario}\n\n"
+                f"TAREFAS PENDENTES:\n{dados_tarefas}\n\n"
+                f"AGENDA DE HOJE:\n{dados_agenda}\n\n"
+                f"MATERIAIS DE ESTUDO DISPONIVEIS:\n{dados_rag[:1500]}\n\n"
+                "Com base nessas informacoes reais, gere um plano de estudos organizado por dia. "
+                "Seja especifico sobre o que estudar em cada dia, considerando os prazos das tarefas. "
+                "Responda em texto corrido, sem JSON, sem markdown, sem asteriscos."
+            )
+        }
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=mensagens_sintese,
+            temperature=0.4,
+            max_tokens=2048,
+        )
+        resposta = response.choices[0].message.content.strip()
+        # Limpa qualquer JSON que o modelo insistir em gerar
+        resposta = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", resposta, flags=re.DOTALL)
+        resposta = re.sub(r'\{"tool".*?\}', "", resposta, flags=re.DOTALL)
+        resposta = resposta.replace("**", "").replace("__", "")
+        resposta = re.sub(r"^#{1,6}\s+", "", resposta, flags=re.MULTILINE)
+        return resposta.strip()
+    except Exception as e:
+        return f"Erro ao gerar plano: {e}"
+
 
 # ---------------------------------------------------------------------------
 # Classe Jarvis
@@ -300,7 +436,7 @@ class Jarvis:
     def __init__(self):
         self.historico: list[dict] = []
         self.system_prompt = _build_system_prompt()
-        print("JARVIS inicializado - Gemma 12B via API do professor")
+        print("JARVIS inicializado - Qwen 2.5 14B via API do professor")
 
     def _chamar_api(self, mensagens: list[dict]) -> str:
         try:
@@ -317,27 +453,22 @@ class Jarvis:
     def _limpar(self, texto: str) -> str:
         texto = texto.replace("**", "").replace("__", "")
         texto = re.sub(r"^#{1,6}\s+", "", texto, flags=re.MULTILINE)
-        # Remove blocos json visiveis
         texto = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", texto, flags=re.DOTALL)
         texto = re.sub(r"```\s*\{.*?\}\s*```", "", texto, flags=re.DOTALL)
         return texto.strip()
 
     def _normalizar_aspas(self, texto: str) -> str:
-        """Converte aspas tipograficas para aspas retas."""
         texto = texto.replace('\u201c', '"').replace('\u201d', '"')
         texto = texto.replace('\u2018', "'").replace('\u2019', "'")
         texto = texto.replace('\u00ab', '"').replace('\u00bb', '"')
         return texto
 
     def _extrair_tool_call(self, texto: str) -> dict | None:
-        # Normaliza aspas antes de tentar extrair
         texto = self._normalizar_aspas(texto)
-
         padroes = [
             r"```json\s*(\{.*?\})\s*```",
             r"```\s*(\{.*?\})\s*```",
             r"(\{[^{}]*\"tool\"[^{}]*\})",
-            # Captura JSON sem bloco de codigo
             r'(\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*\}\s*\})',
         ]
         for padrao in padroes:
@@ -368,7 +499,8 @@ class Jarvis:
             try:
                 logger.info(json.dumps({
                     "timestamp": datetime.now().isoformat(),
-                    "ferramenta": nome, "entrada": args,
+                    "ferramenta": nome,
+                    "entrada": args,
                     "saida": resultado_str[:500],
                 }, ensure_ascii=False))
             except Exception:
@@ -381,7 +513,6 @@ class Jarvis:
             return f"[ERRO] Falha ao executar '{nome}': {e}"
 
     def _validar_historico(self, historico: list) -> list:
-        """Garante alternancia user/assistant."""
         if not historico:
             return historico
         validado = [historico[0]]
@@ -395,65 +526,72 @@ class Jarvis:
     def chat(self, mensagem_usuario: str) -> str:
         self.historico.append({"role": "user", "content": mensagem_usuario})
 
-        contexto_banco = _contexto_tarefas() + "\n" + _contexto_agenda()
+        contexto_banco  = _contexto_tarefas() + "\n" + _contexto_agenda()
         system_completo = self.system_prompt + "\n\n" + contexto_banco
-        historico_valido = self._validar_historico(self.historico)
 
+        # Planejamento: executa diretamente sem passar pelo loop de tool calling
+        if _e_pedido_planejamento(mensagem_usuario):
+            resposta_final = _executar_planejamento(mensagem_usuario, system_completo)
+            self.historico.append({"role": "assistant", "content": resposta_final})
+            return resposta_final
+
+        # Fluxo normal — loop de tool calling
+        historico_valido = self._validar_historico(self.historico)
         mensagens = [
             {"role": "system", "content": system_completo},
             *historico_valido,
         ]
 
-        resposta_modelo = self._chamar_api(mensagens)
-        # Normaliza aspas antes de extrair tool call
-        resposta_modelo_norm = self._normalizar_aspas(resposta_modelo)
-        tool_call = self._extrair_tool_call(resposta_modelo_norm)
+        for _ in range(5):
+            resposta_modelo = self._chamar_api(mensagens)
+            resposta_norm   = self._normalizar_aspas(resposta_modelo)
+            tool_call       = self._extrair_tool_call(resposta_norm)
 
-        if tool_call:
-            tool_name = tool_call.get("tool", "")
-            resultado_ferramenta = self._executar_ferramenta(tool_call)
-
-            if tool_name in FERRAMENTAS_RESPOSTA_LOCAL:
-                resposta_final = _resposta_local(tool_name, resultado_ferramenta)
+            if not tool_call:
+                resposta_final = self._limpar(resposta_modelo)
                 self.historico.append({"role": "assistant", "content": resposta_final})
                 return resposta_final
 
+            tool_name = tool_call.get("tool", "")
+            resultado = self._executar_ferramenta(tool_call)
+
+            # Ferramentas de CRUD: resposta local imediata
+            if tool_name in FERRAMENTAS_RESPOSTA_LOCAL:
+                resposta_final = _resposta_local(tool_name, resultado)
+                self.historico.append({"role": "assistant", "content": resposta_final})
+                return resposta_final
+
+            # gerar_exercicios: resposta imediata
             if tool_name == "gerar_exercicios":
                 try:
-                    d = json.loads(resultado_ferramenta)
-                    exercicios = d.get("exercicios", resultado_ferramenta)
+                    d = json.loads(resultado)
+                    exercicios = d.get("exercicios", resultado)
                 except Exception:
-                    exercicios = resultado_ferramenta
+                    exercicios = resultado
                 resposta_final = self._limpar(str(exercicios))
                 if "Deseja ver as respostas" not in resposta_final:
                     resposta_final += "\n\nDeseja ver as respostas? Digite 'sim' para ver o gabarito."
                 self.historico.append({"role": "assistant", "content": resposta_final})
                 return resposta_final
 
-            mensagens_finais = [
-                {"role": "system", "content": system_completo},
-                {"role": "user", "content": mensagem_usuario},
-                {"role": "assistant", "content": "Executando ferramenta..."},
-                {
-                    "role": "user",
-                    "content": (
-                        f"[Resultado da ferramenta '{tool_name}']: {resultado_ferramenta}. "
-                        "Responda ao usuario em portugues. "
-                        "Nao use markdown, asteriscos ou blocos de codigo. "
-                        "Texto simples apenas."
-                    ),
-                },
-            ]
-            resposta_final = self._limpar(self._chamar_api(mensagens_finais))
-            self.historico.append({"role": "assistant", "content": resposta_final})
-            return resposta_final
+            # RAG e ferramentas complexas: injeta e continua o loop
+            mensagens.append({
+                "role": "assistant",
+                "content": f"Executando ferramenta '{tool_name}'..."
+            })
+            mensagens.append({
+                "role": "user",
+                "content": (
+                    f"[Resultado da ferramenta '{tool_name}']: {resultado}\n"
+                    "Se precisar de mais informacoes, chame outra ferramenta. "
+                    "Caso contrario, responda ao usuario em portugues, sem markdown."
+                )
+            })
 
-        else:
-            # Se a resposta parece ser um tool call mas nao foi reconhecido,
-            # tenta extrair manualmente qualquer JSON com nome de ferramenta
-            resposta_modelo = self._limpar(resposta_modelo)
-            self.historico.append({"role": "assistant", "content": resposta_modelo})
-            return resposta_modelo
+        # Esgotou o loop sem resposta final
+        resposta_final = self._limpar(self._chamar_api(mensagens))
+        self.historico.append({"role": "assistant", "content": resposta_final})
+        return resposta_final
 
     def limpar_historico(self):
         self.historico = []
@@ -465,6 +603,7 @@ class Jarvis:
             role = "Voce" if msg["role"] == "user" else "JARVIS"
             print(f"{role}: {msg['content'][:150]}...")
         print("-----------------\n")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -478,20 +617,26 @@ def main():
     while True:
         try:
             entrada = input("Voce: ").strip()
-            if not entrada: continue
+            if not entrada:
+                continue
             if entrada.lower() == "/sair":
-                print("JARVIS: Ate logo!"); break
+                print("JARVIS: Ate logo!")
+                break
             elif entrada.lower() == "/limpar":
-                jarvis.limpar_historico(); continue
+                jarvis.limpar_historico()
+                continue
             elif entrada.lower() == "/hist":
-                jarvis.mostrar_historico(); continue
+                jarvis.mostrar_historico()
+                continue
             print("JARVIS: ", end="", flush=True)
             print(jarvis.chat(entrada))
             print()
         except KeyboardInterrupt:
-            print("\nJARVIS: Encerrando!"); break
+            print("\nJARVIS: Encerrando!")
+            break
         except Exception as e:
             print(f"\n[ERRO] {e}")
+
 
 if __name__ == "__main__":
     main()
