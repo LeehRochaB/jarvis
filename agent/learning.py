@@ -45,10 +45,11 @@ os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger(__name__)
 
 client = OpenAI(
-    base_url="https://llm.liaufms.org/v1/gemma-3-12b-it",
-    api_key="Cxt2ftLF7d3mHS2JdiFqB-eSDAQeZvFATPXPs02lV9A",
+    base_url="https://api.anthropic.com/v1/",
+    api_key="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",
+    default_headers={"anthropic-version": "2023-06-01"},
 )
-MODEL = "google/gemma-3-12b-it"
+MODEL = "claude-haiku-4-5-20251001"
 
 
 def _chamar_llm(prompt: str, max_tokens: int = 4096) -> str:
@@ -59,6 +60,7 @@ def _chamar_llm(prompt: str, max_tokens: int = 4096) -> str:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
             max_tokens=max_tokens,
+            timeout=60
         )
         return response.choices[0].message.content.strip()
     except Exception as e:

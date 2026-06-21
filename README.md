@@ -2,7 +2,7 @@
 
 Assistente inteligente para estudantes desenvolvido como trabalho prático da disciplina de Inteligência Artificial — FACOM/UFMS (2026.1).
 
-O sistema integra **RAG** (Retrieval-Augmented Generation), **Tool Calling** e o modelo de linguagem **Gemma 12B**, permitindo que estudantes organizem seus estudos, consultem materiais acadêmicos e melhorem seu desempenho por meio de recursos interativos.
+O sistema integra **RAG** (Retrieval-Augmented Generation), **Tool Calling** e o modelo de linguagem **Qwen 2.5 14B**, permitindo que estudantes organizem seus estudos, consultem materiais acadêmicos e melhorem seu desempenho por meio de recursos interativos.
 
 ---
 
@@ -11,7 +11,7 @@ O sistema integra **RAG** (Retrieval-Augmented Generation), **Tool Calling** e o
 - **Consulta a materiais de estudo (RAG)** — perguntas sobre os PDFs das aulas de VVT indexados no ChromaDB
 - **Agenda acadêmica** — adicionar, consultar e importar eventos a partir de PDFs
 - **Lista de tarefas** — CRUD completo com SQLite, prioridades, horários e prazos
-- **Planejamento de estudos** — sugestões baseadas em tarefas, agenda e materiais
+- **Planejamento de estudos** — plano organizado por dia combinando tarefas, agenda e materiais do RAG
 - **Active Recall interativo** — o sistema gera perguntas, o usuário responde e o sistema avalia
 - **Geração de exercícios** — questões sobre qualquer tópico com gabarito
 - **Gerenciamento de notas** — cadastro de disciplinas, registro de notas e cálculo de média
@@ -24,7 +24,7 @@ O sistema integra **RAG** (Retrieval-Augmented Generation), **Tool Calling** e o
 ```
 jarvis/
 ├── agent/
-│   ├── jarvis.py          # Agente principal (LLM, tool calling, histórico)
+│   ├── jarvis.py          # Agente principal (LLM, tool calling, histórico, planejamento)
 │   └── learning.py        # Active recall, exercícios e avaliação
 ├── data/                  # Dataset: PDFs das aulas de VVT
 │   ├── Introducao ao Teste de Software (Marcio Eduardo Delamaro).pdf
@@ -77,7 +77,7 @@ git clone https://github.com/SEU_USUARIO/SEU_REPO.git
 cd SEU_REPO/jarvis
 ```
 
-> **Importante:** Execute o projeto **fora** de pastas sincronizadas pelo OneDrive para evitar bloqueios no SQLite.
+> **Importante:** Execute o projeto **fora** de pastas sincronizadas pelo OneDrive para evitar bloqueios no SQLite e no ChromaDB.
 
 ### 2. Instale as dependências
 
@@ -85,7 +85,13 @@ cd SEU_REPO/jarvis
 pip install -r requirements.txt
 ```
 
-### 3. Execute o sistema
+### 3. Indexe os documentos (apenas na primeira vez)
+
+```bash
+python setup.py
+```
+
+### 4. Execute o sistema
 
 ```bash
 # Windows
@@ -95,7 +101,7 @@ $env:PYTHONIOENCODING="utf-8"; $env:PYTHONUTF8="1"; python app.py
 PYTHONIOENCODING=utf-8 python app.py
 ```
 
-### 4. Acesse no navegador
+### 5. Acesse no navegador
 
 ```
 http://localhost:5000
@@ -109,10 +115,16 @@ A API do modelo está configurada em `agent/jarvis.py`:
 
 ```python
 client = OpenAI(
-    base_url="https://llm.liaufms.org/v1/gemma-3-12b-it",
+    base_url="https://llm.liaufms.org/v1/qwen2-5-14b-instruct-awq",
     api_key="SUA_API_KEY",
 )
-MODEL = "google/gemma-3-12b-it"
+MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
+```
+
+Recomenda-se armazenar a chave em um arquivo `.env` na raiz do projeto:
+
+```
+LLM_API_KEY=sua_chave_aqui
 ```
 
 ---
@@ -121,7 +133,7 @@ MODEL = "google/gemma-3-12b-it"
 
 | Componente | Tecnologia |
 |---|---|
-| LLM | Gemma 12B (API FACOM/UFMS) |
+| LLM | Qwen 2.5 14B (API FACOM/UFMS) |
 | Banco de dados | SQLite com WAL mode |
 | Framework web | Flask |
 | RAG — Embeddings | sentence-transformers (all-MiniLM-L6-v2) |
@@ -170,6 +182,15 @@ Todas as chamadas de ferramentas são registradas em `logs/jarvis.log` em format
   "saida": "[...]"
 }
 ```
+
+---
+
+## 🤖 IAs Utilizadas no Desenvolvimento
+
+| Ferramenta | Uso |
+|---|---|
+| Claude (Anthropic) | Geração de código Python, revisão de bugs, documentação, refinamento de prompts do sistema |
+| GitHub Copilot | Autocomplete de código no VS Code |
 
 ---
 
