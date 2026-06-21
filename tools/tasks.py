@@ -102,9 +102,13 @@ def listar_tarefas(filtro=None):
     hoje = date.today().isoformat()
     with _conectar() as conn:
         if filtro == "pendentes":
-            rows = conn.execute("SELECT * FROM tarefas WHERE concluida=0 ORDER BY data_entrega, horario, id").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM tarefas WHERE concluida=0 ORDER BY data_entrega, horario, id"
+            ).fetchall()
         elif filtro == "concluidas":
-            rows = conn.execute("SELECT * FROM tarefas WHERE concluida=1 ORDER BY id").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM tarefas WHERE concluida=1 ORDER BY id"
+            ).fetchall()
         elif filtro == "atrasadas":
             rows = conn.execute(
                 "SELECT * FROM tarefas WHERE concluida=0 AND data_entrega IS NOT NULL AND data_entrega < ? ORDER BY data_entrega, horario",
@@ -116,12 +120,18 @@ def listar_tarefas(filtro=None):
                 (hoje,)
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM tarefas ORDER BY data_entrega, horario, id").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM tarefas ORDER BY data_entrega, horario, id"
+            ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
 
 def adicionar_tarefa(descricao, data_entrega=None, horario=None, prioridade="normal"):
     data_iso = _normalizar_data(data_entrega)
     hora_fmt = _normalizar_horario(horario)
+    # Normaliza aliases antes de validar
+    aliases = {"media": "normal", "medio": "normal", "médio": "normal", "média": "normal"}
+    prioridade = aliases.get(str(prioridade).lower().strip(), prioridade) if prioridade else "normal"
     prio = prioridade if prioridade in ("baixa", "normal", "alta") else "normal"
     with _conectar() as conn:
         cur = conn.execute(
@@ -137,34 +147,47 @@ def adicionar_tarefa(descricao, data_entrega=None, horario=None, prioridade="nor
         msg += f" - entrega: {p[2]}/{p[1]}/{p[0]} as {hora_fmt}"
     return {"status": "ok", "tarefa": tarefa, "mensagem": msg}
 
+
 def concluir_tarefa(indice):
     tasks = listar_tarefas()
     if 0 <= indice < len(tasks):
         t = tasks[indice]
         with _conectar() as conn:
-            conn.execute("UPDATE tarefas SET concluida=1, concluida_em=? WHERE id=?",
-                         (date.today().isoformat(), t["id"]))
+            conn.execute(
+                "UPDATE tarefas SET concluida=1, concluida_em=? WHERE id=?",
+                (date.today().isoformat(), t["id"])
+            )
             conn.commit()
         return {"status": "ok", "mensagem": f"Tarefa '{t['descricao']}' concluida!"}
     return {"erro": "Indice invalido"}
+
 
 def concluir_tarefa_por_nome(nome: str):
     nome_lower = nome.lower().strip()
     hoje = date.today().isoformat()
     tasks = listar_tarefas()
+    # Match exato
     for t in tasks:
         if t["descricao"].lower().strip() == nome_lower and not t["concluida"]:
             with _conectar() as conn:
-                conn.execute("UPDATE tarefas SET concluida=1, concluida_em=? WHERE id=?", (hoje, t["id"]))
+                conn.execute(
+                    "UPDATE tarefas SET concluida=1, concluida_em=? WHERE id=?",
+                    (hoje, t["id"])
+                )
                 conn.commit()
             return {"status": "ok", "mensagem": f"Tarefa '{t['descricao']}' concluida!"}
+    # Match parcial
     for t in tasks:
         if nome_lower in t["descricao"].lower() and not t["concluida"]:
             with _conectar() as conn:
-                conn.execute("UPDATE tarefas SET concluida=1, concluida_em=? WHERE id=?", (hoje, t["id"]))
+                conn.execute(
+                    "UPDATE tarefas SET concluida=1, concluida_em=? WHERE id=?",
+                    (hoje, t["id"])
+                )
                 conn.commit()
             return {"status": "ok", "mensagem": f"Tarefa '{t['descricao']}' concluida!"}
     return {"erro": f"Tarefa '{nome}' nao encontrada ou ja concluida"}
+
 
 def atualizar_data_entrega(indice, nova_data, novo_horario=None):
     tasks = listar_tarefas()
@@ -172,13 +195,64 @@ def atualizar_data_entrega(indice, nova_data, novo_horario=None):
         data_iso = _normalizar_data(nova_data)
         if not data_iso:
             return {"erro": f"Data invalida: '{nova_data}'"}
-        hora_fmt = _normalizar_horario(novo_horario)
+        hora_fmt = _normalizar_horario(novo_horario) if novo_horario else tasks[indice]["horario"]
         t = tasks[indice]
         with _conectar() as conn:
-            conn.execute("UPDATE tarefas SET data_entrega=?, horario=? WHERE id=?", (data_iso, hora_fmt, t["id"]))
+            conn.execute(
+                "UPDATE tarefas SET data_entrega=?, horario=? WHERE id=?",
+                (data_iso, hora_fmt, t["id"])
+            )
             conn.commit()
-        return {"status": "ok", "mensagem": f"Data de entrega atualizada para {data_iso} as {hora_fmt}"}
+        p = data_iso.split("-")
+        return {"status": "ok", "mensagem": f"Data de entrega atualizada para {p[2]}/{p[1]}/{p[0]} as {hora_fmt}"}
     return {"erro": "Indice invalido"}
+
+
+def atualizar_horario_por_nome(nome: str, novo_horario: str, nova_data: str = None):
+    """
+    Atualiza horario (e opcionalmente data) de uma tarefa pelo nome.
+    Preferir esta funcao a atualizar_data_entrega quando o usuario mencionar o nome da tarefa.
+    """
+    nome_lower = nome.lower().strip()
+    tasks = listar_tarefas()
+    tarefa = None
+
+    # Match exato
+    for t in tasks:
+        if t["descricao"].lower().strip() == nome_lower:
+            tarefa = t
+            break
+    # Match parcial
+    if not tarefa:
+        for t in tasks:
+            if nome_lower in t["descricao"].lower():
+                tarefa = t
+                break
+
+    if not tarefa:
+        return {"erro": f"Tarefa '{nome}' nao encontrada"}
+
+    hora_fmt = _normalizar_horario(novo_horario)
+    data_iso = _normalizar_data(nova_data) if nova_data else tarefa["data_entrega"]
+
+    with _conectar() as conn:
+        conn.execute(
+            "UPDATE tarefas SET horario=?, data_entrega=? WHERE id=?",
+            (hora_fmt, data_iso, tarefa["id"])
+        )
+        conn.commit()
+
+    if data_iso:
+        p = data_iso.split("-")
+        data_fmt = f"{p[2]}/{p[1]}/{p[0]}"
+    else:
+        data_fmt = "sem data"
+
+    return {
+        "status": "ok",
+        "mensagem": f"Tarefa '{tarefa['descricao']}' atualizada para {data_fmt} as {hora_fmt}"
+    }
+
 
 def remover_tarefa(indice):
     tasks = listar_tarefas()
@@ -190,15 +264,18 @@ def remover_tarefa(indice):
         return {"status": "ok", "mensagem": f"Tarefa '{t['descricao']}' removida"}
     return {"erro": "Indice invalido"}
 
+
 def remover_tarefa_por_nome(nome: str):
     nome_lower = nome.lower().strip()
     tasks = listar_tarefas()
+    # Match exato
     for t in tasks:
         if t["descricao"].lower().strip() == nome_lower:
             with _conectar() as conn:
                 conn.execute("DELETE FROM tarefas WHERE id=?", (t["id"],))
                 conn.commit()
             return {"status": "ok", "mensagem": f"Tarefa '{t['descricao']}' removida"}
+    # Match parcial
     for t in tasks:
         if nome_lower in t["descricao"].lower():
             with _conectar() as conn:
@@ -206,6 +283,7 @@ def remover_tarefa_por_nome(nome: str):
                 conn.commit()
             return {"status": "ok", "mensagem": f"Tarefa '{t['descricao']}' removida"}
     return {"erro": f"Tarefa '{nome}' nao encontrada"}
+
 
 def tarefas_proximas(dias=7):
     hoje = date.today()
