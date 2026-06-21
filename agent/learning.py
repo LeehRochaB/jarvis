@@ -45,11 +45,10 @@ os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger(__name__)
 
 client = OpenAI(
-    base_url="https://api.anthropic.com/v1/",
-    api_key="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",
-    default_headers={"anthropic-version": "2023-06-01"},
+    base_url="https://llm.liaufms.org/v1/qwen2-5-14b-instruct-awq",
+    api_key=os.getenv("LLM_API_KEY", ""),
 )
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "Qwen/Qwen2.5-14B-Instruct-AWQ"
 
 
 def _chamar_llm(prompt: str, max_tokens: int = 4096) -> str:
