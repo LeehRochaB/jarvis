@@ -1,6 +1,10 @@
-# requirements.txt
-ollama          # para rodar Gemma 12B localmente
-sentence-transformers  # embeddings
-chromadb        # banco vetorial (gratuito, local)
-langchain       # chunking e utilidades RAG
-pypdf           # ler PDFs
+openai>=1.0.0
+flask>=3.0.0
+sentence-transformers>=2.7.0
+chromadb>=0.5.0
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-text-splitters>=0.2.0
+pypdf>=4.0.0
+werkzeug>=3.0.0
+python-dotenv>=1.0.0
