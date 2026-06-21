@@ -1,0 +1,6 @@
+
+__pycache__/
+*.pyc
+logs/jarvis.log
+chroma_db/
+.env
